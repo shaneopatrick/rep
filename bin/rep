@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""rep: the command-line face of the Phase 0 harness.
+
+For you, in a terminal:
+  rep init [--dial dim]     turn rep on for this repo
+  rep dial dark|dim|lit     set the light switch
+  rep pin <paths>           pin tests (read-only for the agent)
+  rep unpin [paths]         unpin some, or all
+  rep skip [predict|todo]   skip a rep (free, logged)
+  rep close                 close the open task without a retro
+
+For you and the agent:
+  rep status                dial, open task, pins, TODO(human) files
+  rep log                   the most recent reps
+  rep log retro ...         record a retro and close the task (agent, after /retro)
+  rep report                the Phase 0 go/no-go numbers
+  rep restore <file>        put back a protected file changed through Bash
+  rep doctor                check the install
+
+Inside Claude Code, use /dial /predict /skip /pin /hint /retro instead.
+"""
+import argparse
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "hooks"))
+import replib  # noqa: E402
+
+HOOKS = ("on_prompt", "predict_gate", "lock_tests", "guard_human", "bash_guard", "bash_audit")
+SKILLS = ("predict", "retro", "dial", "skip", "pin", "hint")
+
+
+def need_root():
+    root = replib.find_root(os.getcwd())
+    if not root:
+        sys.exit("rep is not enabled here. Run `rep init` at the repo root.")
+    return root
+
+
+def cmd_init(args):
+    root, notes = replib.init_root(os.getcwd(), args.dial)
+    dial = replib.load_state(root)["dial"]
+    print("\n".join(notes))
+    print("[rep] dial=%s. %s" % (dial, replib.DIAL_MEANING[dial]))
+
+
+def cmd_dial(args):
+    root = need_root()
+    with replib.state_tx(root) as state:
+        print(replib.set_dial(root, state, args.value))
+
+
+def cmd_pin(args):
+    root = need_root()
+    with replib.state_tx(root) as state:
+        print(replib.pin(root, state, args.paths, os.getcwd()))
+
+
+def cmd_unpin(args):
+    root = need_root()
+    with replib.state_tx(root) as state:
+        print(replib.unpin(root, state, [replib.rel(root, p) if os.path.exists(p) else p for p in args.paths]))
+
+
+def cmd_skip(args):
+    root = need_root()
+    with replib.state_tx(root) as state:
+        print(replib.skip(root, state, args.what, "terminal"))
+
+
+def cmd_close(args):
+    root = need_root()
+    with replib.state_tx(root) as state:
+        print(replib.retro_start(root, state, "skip", "terminal"))
+
+
+def cmd_status(args):
+    root = need_root()
+    state = replib.load_state(root)
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return
+    task, work = state["task"], state["work"]
+    print("rep: %s  (dial %s)" % (root, state["dial"]))
+    if task:
+        print("task %s, open %s, goal \"%s\"" % (task["id"], replib.ago(task["started_at"]), replib._clip(task["goal"], 100)))
+        for i, p in enumerate(task["predictions"], 1):
+            print("  prediction %d: \"%s\"" % (i, replib._clip(p["text"], 160)))
+        if task["skipped"]:
+            print("  skipped: %s" % ", ".join(task["skipped"]))
+        if task["retro_at"]:
+            print("  retro in progress")
+    elif state["dial"] == "dark":
+        print("no open task (dark: no prediction needed)")
+    else:
+        print("no open task: edits are locked until a prediction or /skip")
+    if state["region_files"]:
+        print("TODO(human): %s, hints %d/%d%s" % (", ".join(state["region_files"]), work["hints"], len(replib.HINTS),
+                                                  ", released" if work["todo_released"] else ""))
+    if state["pins"]:
+        print("pinned: %s" % ", ".join(sorted(state["pins"])))
+    print("this task: %d gate denial(s), %d blocked edit(s), %d Bash violation(s)" % (
+        work["denials"], work["blocked"], work["violations"]))
+
+
+def _numbered(values, cast=str):
+    """["2=miss", "match"] -> {2: "miss", 1: "match"}: a bare value means prediction 1."""
+    out = {}
+    for value in values or []:
+        head, sep, tail = value.partition("=")
+        if sep and head.strip().isdigit():
+            out[int(head)] = cast(tail.strip())
+        else:
+            out[1] = cast(value.strip())
+    return out
+
+
+def cmd_log(args):
+    root = need_root()
+    if args.what != "retro":
+        rows = replib.read_jsonl(root, "reps.jsonl")[-args.tail:]
+        if not rows:
+            print("no reps yet")
+        for r in rows:
+            body = r.get("prediction") or r.get("lesson") or r.get("evidence") or ""
+            print("%-12s %-4s %-8s %-8s %s" % (r["id"], r.get("dial", ""), r.get("kind", ""),
+                                               r.get("outcome") or "-", replib._clip(body, 90)))
+        return
+    fields = {
+        "grades": _numbered(args.grade, str.lower), "evidence": _numbered(args.evidence),
+        "surprise": args.surprise or "", "lesson": args.lesson or "",
+        "codified": ({"kind": args.codify, "path": args.path or ("lessons.md" if args.codify == "context" else "")}
+                     if args.codify != "none" else None),
+        "todo": args.todo, "todo_rating": args.todo_rating,
+        "skills": [s.strip() for s in (args.skills or "").split(",") if s.strip()],
+    }
+    with replib.state_tx(root) as state:
+        task_id, error = replib.log_retro(root, state, fields)
+    if error:
+        sys.exit(error)
+    print("[rep] retro logged and task %s closed. The next task needs a fresh prediction." % task_id)
+
+
+def cmd_report(args):
+    root = need_root()
+    tasks = [e for e in replib.read_jsonl(root, "events.jsonl") if e.get("event") == "task_close"]
+    events = replib.read_jsonl(root, "events.jsonl")
+    reps = replib.read_jsonl(root, "reps.jsonl")
+    count = lambda rows, **kv: sum(1 for r in rows if all(r.get(k) == v for k, v in kv.items()))  # noqa: E731
+
+    print("rep report: %s" % root)
+    print("tasks      %d closed (%s)" % (len(tasks), ", ".join("%s %d" % (d, count(tasks, dial=d)) for d in replib.DIALS)))
+    predicts = [r for r in reps if r.get("kind") == "predict"]
+    print("predict    %d made: %s, ungraded %d; skipped %d" % (
+        sum(1 for r in predicts if r.get("prediction")),
+        ", ".join("%s %d" % (o, count(predicts, outcome=o)) for o in replib.OUTCOMES),
+        sum(1 for r in predicts if r.get("prediction") and not r.get("outcome")), count(predicts, outcome="skipped")))
+    todos = [r for r in reps if r.get("kind") == "todo"]
+    ratings = [r["rating"] for r in todos if r.get("rating")]
+    print("todo       %d placed: done %d, released %d; hints avg %.1f; core-logic rating avg %s" % (
+        len(todos), count(todos, outcome="match"), count(todos, outcome="skipped"),
+        sum(r.get("hintsUsed", 0) for r in todos) / float(len(todos) or 1),
+        "%.1f" % (sum(ratings) / float(len(ratings))) if ratings else "-"))
+    retros = [r for r in reps if r.get("kind") == "retro"]
+    kinds = [r["codified"]["kind"] for r in retros if r.get("codified")]
+    print("retro      %d done, %d skipped; codified: %s" % (
+        len(retros) - count(retros, outcome="skipped"), count(retros, outcome="skipped"),
+        ", ".join("%s %d" % (k, kinds.count(k)) for k in sorted(set(kinds))) or "nothing"))
+    duration, overhead = sum(t["durationS"] for t in tasks), sum(t["overheadS"] for t in tasks)
+    print("overhead   %.1f min over %.1f min of task time (%s; target under 10%%)" % (
+        overhead / 60.0, duration / 60.0, "%.0f%%" % (100.0 * overhead / duration) if duration else "-"))
+    print("enforced   %d gate denial(s), %d blocked edit(s), %d Bash command(s) refused" % (
+        count(events, event="gate_deny"), count(events, event="guard_deny") + count(events, event="lock_deny"),
+        count(events, event="bash_deny")))
+    print("bypasses   %d protected-file change(s) through Bash (0 is the goal)" % sum(
+        len(e.get("files", [])) for e in events if e.get("event") == "violation"))
+
+
+def cmd_restore(args):
+    root = need_root()
+    file = args.file
+    if os.path.exists(file) or os.path.isabs(file):
+        file = replib.rel(root, file)
+    keep = replib.keep_path(root, file)
+    if not os.path.exists(keep):
+        sys.exit("rep: no kept pre-image for %s" % file)
+    replib.write_text(os.path.join(root, file), replib.read_text(keep))
+    replib.event(root, "restore", file=file)
+    print("[rep] %s restored to its state before the Bash command." % file)
+
+
+def cmd_doctor(args):
+    home = os.path.expanduser("~/.claude")
+    ok = True
+
+    def check(label, good, fix=""):
+        nonlocal ok
+        ok = ok and good
+        print("%s %s%s" % ("ok  " if good else "FAIL", label, "" if good or not fix else "  -> " + fix))
+
+    check("python %d.%d" % sys.version_info[:2], sys.version_info >= (3, 8), "needs 3.8+")
+    for name in HOOKS + ("replib",):
+        check("hook  %s.py" % name, os.path.exists(os.path.join(home, "hooks", name + ".py")), "run install.py")
+    for name in SKILLS:
+        check("skill /%s" % name, os.path.exists(os.path.join(home, "skills", name, "SKILL.md")), "run install.py")
+    check("style %s" % replib.STYLE, os.path.exists(os.path.join(home, "output-styles", replib.STYLE + ".md")),
+          "run install.py")
+    try:
+        with open(os.path.join(home, "settings.json")) as f:
+            registered = json.dumps(json.load(f).get("hooks", {}))
+    except (OSError, ValueError):
+        registered = ""
+    for name in HOOKS:
+        check("settings.json runs %s.py" % name, "hooks/%s.py" % name in registered, "run install.py")
+
+    root = replib.find_root(os.getcwd())
+    if not root:
+        print("--   rep is not enabled in this directory (`rep init`)")
+    else:
+        state = replib.load_state(root)
+        print("--   enabled in %s, dial %s, %s" % (root, state["dial"], "task open" if state["task"] else "no open task"))
+        try:
+            with open(os.path.join(root, ".claude", "settings.local.json")) as f:
+                style = json.load(f).get("outputStyle")
+        except (OSError, ValueError):
+            style = None
+        check("output style for this repo is %s" % replib.STYLE, style == replib.STYLE,
+              "/output-style %s" % replib.STYLE)
+    sys.exit(0 if ok else 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="rep", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command")
+    sub.required = True
+
+    p = sub.add_parser("init"); p.add_argument("--dial", choices=replib.DIALS, default="dim"); p.set_defaults(fn=cmd_init)
+    p = sub.add_parser("dial"); p.add_argument("value", choices=replib.DIALS); p.set_defaults(fn=cmd_dial)
+    p = sub.add_parser("pin"); p.add_argument("paths", nargs="*"); p.set_defaults(fn=cmd_pin)
+    p = sub.add_parser("unpin"); p.add_argument("paths", nargs="*"); p.set_defaults(fn=cmd_unpin)
+    p = sub.add_parser("skip"); p.add_argument("what", nargs="?", default="", choices=("", "predict", "todo")); p.set_defaults(fn=cmd_skip)
+    p = sub.add_parser("close"); p.set_defaults(fn=cmd_close)
+    p = sub.add_parser("status"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("report"); p.set_defaults(fn=cmd_report)
+    p = sub.add_parser("restore"); p.add_argument("file"); p.set_defaults(fn=cmd_restore)
+    p = sub.add_parser("doctor"); p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("log")
+    p.add_argument("what", nargs="?", choices=("retro",))
+    p.add_argument("--tail", type=int, default=10)
+    p.add_argument("--grade", action="append", metavar="N=match|partial|miss")
+    p.add_argument("--evidence", action="append", metavar="N=TEXT")
+    p.add_argument("--surprise")
+    p.add_argument("--lesson")
+    p.add_argument("--codify", choices=("none", "context", "lint", "test", "hook", "skill"), default="none")
+    p.add_argument("--path")
+    p.add_argument("--todo", choices=("done", "released"))
+    p.add_argument("--todo-rating", type=int, choices=range(1, 6))
+    p.add_argument("--skills")
+    p.set_defaults(fn=cmd_log)
+
+    args = parser.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
