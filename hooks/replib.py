@@ -1,19 +1,22 @@
-"""rep: shared library for the Phase 0 hooks and the `rep` CLI.
+"""rep: shared library for the hooks and the `rep` CLI.
 
-Everything that reads or writes <repo>/.rep/ goes through this module, so
-state changes in exactly one place. Stdlib only; runs on Python 3.8+. Hooks run on every tool call, so modules
-that only some paths need are imported where they are used.
+rep's unit of work is the brief: a one-screen contract for one piece of work.
+You shape and approve it; agents work inside it. Everything that reads or
+writes <repo>/.rep/ goes through this module. Stdlib only, Python 3.8+.
+Hooks run on every tool call, so modules that only some paths need are
+imported where they are used.
 
 <repo>/.rep/
-  state.json    dial, open task, pins, counters for the work in progress
-  reps.jsonl    one line per finished rep (the Phase 1 seed data)
-  events.jsonl  audit trail: gate denials, blocked edits, dial changes, ...
-  keep/         pre-images of protected files that changed during a Bash call
+  .gitignore    "*": nothing in here is ever committed, from any worktree
+  briefs/       one markdown file per brief, plus draft.md while shaping
+  state.json    active brief, base snapshot, check runs, pins, counters
+  reps.jsonl    one line per closed brief (and any Phase 0 reps)
+  events.jsonl  audit trail: approvals, budget trips, refused edits, ...
+  keep/         pre-images of protected files changed through Bash
 
-Who may change state: hooks acting on something the user typed, and the user
-running `rep` in a terminal. The agent's own surface is `rep status`,
-`rep report`, `rep restore` and `rep log retro` (only after the user typed
-/retro). bash_guard.py enforces that split.
+Who changes what: the brief's contract changes only when the user types
+/approve. The agent drafts (`rep brief draft`), notes (`rep note`) and runs
+the check (`rep check`). bash_guard.py keeps the user's commands the user's.
 """
 import fcntl
 import json
@@ -25,13 +28,17 @@ from collections import Counter
 from contextlib import contextmanager
 
 REP_DIR = ".rep"
-DIALS = ("dark", "dim", "lit")
 STYLE = "rep-tutor"
-OUTCOMES = ("match", "partial", "miss")
-STALE_SECONDS = 12 * 3600      # an untouched task closes itself, ungraded
-MAX_TODOS = 2                  # friction budget: TODO(human) regions per task
-MAX_WAIT = 900                 # longer gaps before a prediction are not counted as overhead
+MAX_BRIEF_LINES = 40           # the contract has to fit on one screen
+MAX_TODOS = 2                  # TODO(human) regions per brief
 MAX_SCAN_BYTES = 2000000
+NOT_COUNTED = {"lessons.md"}   # codifying a lesson never trips the budget
+MANIFESTS = {
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "pyproject.toml",
+    "poetry.lock", "uv.lock", "Pipfile", "Pipfile.lock", "setup.py", "setup.cfg", "go.mod", "go.sum",
+    "Cargo.toml", "Cargo.lock", "Gemfile", "Gemfile.lock", "pom.xml", "build.gradle", "build.gradle.kts",
+    "composer.json", "composer.lock",
+}
 HINTS = (
     ("nudge", "a question or pointer that directs attention; no concept names, no code"),
     ("concept", "name the concept or pattern and why it applies here; no code"),
@@ -39,12 +46,7 @@ HINTS = (
     ("partial code", "real code for the scaffolding, with the crux left blank"),
     ("full solution", "the complete solution, shown in chat only; the user still types it"),
 )
-DIAL_MEANING = {
-    "dark": "Ghostwriter mode: no prediction needed, pinned tests unlocked, open TODO(human) regions released.",
-    "dim": "One prediction before edits, a retro at the end.",
-    "lit": "Prediction before edits, tests the user wrote or approved and pinned (/pin), "
-           "one TODO(human) on core logic, a retro at the end.",
-}
+PREMORTEM_PLACEHOLDER = "(yours: add it with /approve <where you expect this to go wrong>)"
 
 
 # --- time -------------------------------------------------------------------
@@ -59,11 +61,8 @@ def iso(ts=None):
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def ago(ts):
-    if not ts:
-        return "?"
-    minutes = max(0, now() - ts) // 60
-    return "%dm" % minutes if minutes < 120 else "%dh" % (minutes // 60)
+def stamp(ts=None):
+    return time.strftime("%m-%d %H:%M", time.localtime(now() if ts is None else ts))
 
 
 # --- locating the repo ------------------------------------------------------
@@ -112,22 +111,23 @@ def rel(root, path):
     return os.path.relpath(os.path.realpath(path), root).replace(os.sep, "/")
 
 
-def init_root(start, dial="dim"):
+def ensure_ignored(root):
+    """A .gitignore of "*" inside .rep/ ignores the folder from every worktree,
+    whatever the repo's own ignore rules say."""
+    path = rep_path(root, ".gitignore")
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write("*\n")
+
+
+def init_root(start):
     """Turn rep on for the repo containing `start`. Returns (root, notes)."""
     root = git_top(start) or _existing_dir(start)
-    os.makedirs(rep_path(root), exist_ok=True)
-    notes = ["[rep] enabled in %s (state lives in .rep/)." % root]
+    os.makedirs(rep_path(root, "briefs"), exist_ok=True)
+    ensure_ignored(root)
+    notes = ["[rep] enabled in %s (state lives in .rep/, never committed)." % root]
     if not os.path.exists(rep_path(root, "state.json")):
-        save_state(root, new_state(dial))
-
-    info = os.path.join(root, ".git", "info")
-    if os.path.isdir(os.path.join(root, ".git")):
-        os.makedirs(info, exist_ok=True)
-        exclude = os.path.join(info, "exclude")
-        have = read_text(exclude)
-        if ".rep/" not in have.split():
-            with open(exclude, "a") as f:
-                f.write(("" if have.endswith("\n") or not have else "\n") + ".rep/\n")
+        save_state(root, new_state())
 
     settings = os.path.join(root, ".claude", "settings.local.json")
     try:
@@ -141,42 +141,48 @@ def init_root(start, dial="dim"):
         local["outputStyle"] = STYLE
         os.makedirs(os.path.dirname(settings), exist_ok=True)
         _atomic_write(settings, json.dumps(local, indent=2) + "\n")
-        notes.append("[rep] output style set to %s for this repo (takes effect on the next message or session)." % STYLE)
     else:
-        notes.append("[rep] output style is %r here; left as is. /output-style %s switches to the tutor voice."
+        notes.append("[rep] output style is %r here; left as is. /output-style %s gives the brief-aware voice."
                      % (local["outputStyle"], STYLE))
     return root, notes
 
 
 # --- state ------------------------------------------------------------------
 
-def new_work():
-    """Counters for the work in progress. Reset whenever a task closes."""
-    return {"goal": "", "goal_at": None, "goal_session": None, "asked_at": None, "denials": 0, "blocked": 0,
-            "violations": 0, "hints": 0, "todos": {}, "todo_released": False}
-
-
-def new_state(dial="dim"):
-    return {"v": 1, "dial": dial, "seq": 0, "task": None, "work": new_work(),
-            "pins": {}, "region_files": [], "last_session": None, "touched_at": None}
+def new_state():
+    return {
+        "v": 2,
+        "active": None,        # briefs/<file>.md once approved
+        "draft": None,         # briefs/draft.md while shaping or revising
+        "asked": None,         # the user's /shape words, verbatim
+        "base": None,          # snapshot of the code at /approve; the budget is measured from it
+        "approved_at": None,
+        "review_at": None,
+        "runs": [],            # `rep check` history: at, ok, secs, tree, code
+        "flakes": 0,
+        "turn_tree": None,     # state of the code when the user's last prompt arrived
+        "trips": 0,            # budget breaker trips
+        "refused": 0,          # edits refused for scope or dependencies
+        "over_reported": 0,
+        "pins": {},
+        "region_files": [],
+        "todos": {},
+        "hints": 0,
+        "todo_released": False,
+        "violations": 0,
+    }
 
 
 def load_state(root):
-    """Read state.json. A missing or unreadable file reads as a fresh state,
-    which has no open task, so the prediction gate fails closed."""
+    """Read state.json. Phase 0 state (v1) and unreadable files read as fresh."""
     state = new_state()
     try:
         with open(rep_path(root, "state.json")) as f:
             saved = json.load(f)
-        if isinstance(saved, dict):
+        if isinstance(saved, dict) and saved.get("v") == 2:
             state.update(saved)
     except (OSError, ValueError):
         pass
-    if state["dial"] not in DIALS:
-        state["dial"] = "dim"
-    work = new_work()
-    work.update(state.get("work") or {})
-    state["work"] = work
     return state
 
 
@@ -189,6 +195,7 @@ def _atomic_write(path, text):
 
 def save_state(root, state):
     os.makedirs(rep_path(root), exist_ok=True)
+    ensure_ignored(root)
     _atomic_write(rep_path(root, "state.json"), json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
@@ -235,6 +242,499 @@ def read_jsonl(root, name):
     return rows
 
 
+def _clip(text, limit):
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+# --- files ------------------------------------------------------------------
+
+def read_text(path):
+    try:
+        if os.path.getsize(path) > MAX_SCAN_BYTES:
+            return ""
+        with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        f.write(text)
+
+
+def simulate(tool, tool_input, before):
+    """The file's text after this edit, or None when that cannot be worked out."""
+    if tool == "Write":
+        return tool_input.get("content") or ""
+    if tool == "Edit":
+        edits = [tool_input]
+    elif tool == "MultiEdit":
+        edits = tool_input.get("edits") or []
+    else:
+        return None
+    text = before
+    for edit in edits:
+        old, new = edit.get("old_string") or "", edit.get("new_string") or ""
+        if not old:
+            if text:
+                return None
+            text = new
+        elif old not in text:
+            return None
+        elif edit.get("replace_all"):
+            text = text.replace(old, new)
+        else:
+            text = text.replace(old, new, 1)
+    return text
+
+
+# --- measuring the work against its base -------------------------------------
+
+def git(root, *args):
+    """(exit code, stdout) for a git command in `root`; (1, "") if git fails."""
+    import subprocess
+    try:
+        proc = subprocess.run(["git", "-C", root] + list(args), stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return proc.returncode, proc.stdout.decode("utf-8", "surrogateescape")
+
+
+def snapshot(root):
+    """The working tree as a git tree object, untracked files included.
+
+    Uses a private index in .rep/, so the user's index, branch and stash are
+    never touched. Equal snapshots mean identical code. Measuring the budget
+    from the snapshot taken at /approve means work that was already sitting
+    uncommitted never counts against a new brief. None outside git.
+    """
+    if not os.path.exists(os.path.join(root, ".git")):
+        return None
+    import subprocess
+    env = dict(os.environ, GIT_INDEX_FILE=rep_path(root, "snapshot.index"))
+    with open(rep_path(root, ".snaplock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        out = b""
+        for args in (["add", "-A"], ["write-tree"]):
+            try:
+                proc = subprocess.run(["git", "-C", root] + args, env=env, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if proc.returncode != 0:
+                return None
+            out = proc.stdout
+    return out.decode().strip() or None
+
+
+def _noise(path):
+    return "__pycache__/" in path or path.endswith(".pyc")
+
+
+def changes(root, base, current=None):
+    """{path: (added, deleted)} between the `base` snapshot and the code now."""
+    current = current or snapshot(root)
+    out = {}
+    if not base or not current:
+        return out
+    _, text = git(root, "diff", "--numstat", "--no-renames", base, current)
+    for line in text.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3 and not _noise(parts[2]):
+            added, deleted, path = parts
+            out[path] = (int(added) if added.isdigit() else 0, int(deleted) if deleted.isdigit() else 0)
+    return out
+
+
+def size(change_map):
+    """(files, lines) changed, leaving out lessons.md."""
+    counted = [v for p, v in change_map.items() if p not in NOT_COUNTED]
+    return len(counted), sum(a + d for a, d in counted)
+
+
+def line_delta(old, new):
+    """(added, deleted) lines between two texts."""
+    import difflib
+    added = deleted = 0
+    in_hunk = False
+    for line in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0):
+        if line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line.startswith("+"):
+            added += 1
+        elif in_hunk and line.startswith("-"):
+            deleted += 1
+    return added, deleted
+
+
+def base_text(root, base, relpath):
+    code, out = git(root, "show", "%s:%s" % (base, relpath))
+    return out if code == 0 else ""
+
+
+# --- briefs -----------------------------------------------------------------
+#
+# A brief is markdown with fixed sections. Goal, Approach, Budget and Check
+# are the contract: the agent drafts them, the user approves them. Pre-mortem
+# (the user's words) and Log (notes and harness facts) are written by rep.
+
+CONTRACT = ("goal", "approach", "budget", "check")
+_SECTION = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.M)
+_FIELD = re.compile(r"^[ \t]*[-*]?[ \t]*(lines|files|paths|deps|cmd|unverified)[ \t]*:[ \t]*(.*?)[ \t]*$", re.I | re.M)
+
+
+def parse_brief(text):
+    title = re.search(r"^#[ \t]+(?:Brief:[ \t]*)?(.+?)[ \t]*$", text, re.M)
+    asked = re.search(r"^Asked:[ \t]*\"?(.*?)\"?[ \t]*$", text, re.M)
+    parts = _SECTION.split(text)
+    sections, order = {}, []
+    for i in range(1, len(parts), 2):
+        name = parts[i].strip().lower()
+        sections[name] = parts[i + 1].strip("\n")
+        order.append(name)
+    fields = {}
+    for name in ("budget", "check"):
+        for m in _FIELD.finditer(sections.get(name, "")):
+            fields[m.group(1).lower()] = m.group(2)
+    return {"title": title.group(1) if title else "", "asked": asked.group(1) if asked else "",
+            "sections": sections, "order": order, "fields": fields}
+
+
+def budget_of(brief):
+    fields = brief["fields"]
+
+    def number(key):
+        m = re.match(r"\d+", fields.get(key, ""))
+        return int(m.group()) if m else None
+
+    paths = [p.strip().rstrip("/") for p in re.split(r"[,\s]+", fields.get("paths", "")) if p.strip()]
+    return {"lines": number("lines"), "files": number("files"), "paths": paths,
+            "deps": fields.get("deps", "no").strip().lower() in ("yes", "y", "true", "allowed")}
+
+
+def check_cmd(brief):
+    return brief["fields"].get("cmd", "").strip("` ") or None
+
+
+def problems(brief):
+    """What stops a draft from being a usable contract."""
+    issues = []
+    if not brief["title"]:
+        issues.append("a '# Brief: <title>' line")
+    for name in CONTRACT:
+        if not brief["sections"].get(name, "").strip():
+            issues.append("a '## %s' section" % name.capitalize())
+    budget = budget_of(brief)
+    if budget["lines"] is None or budget["files"] is None:
+        issues.append("'lines: <n>' and 'files: <n>' under Budget")
+    if not check_cmd(brief):
+        issues.append("'cmd: <command>' under Check")
+    contract_lines = 1 + sum(len(brief["sections"].get(name, "").strip().splitlines()) + 1 for name in CONTRACT)
+    if contract_lines > MAX_BRIEF_LINES:
+        issues.append("fewer lines: %d, and the limit is %d so it fits on one screen" % (contract_lines, MAX_BRIEF_LINES))
+    return issues
+
+
+def render_brief(brief, premortem, log, asked):
+    out = ["# Brief: %s" % brief["title"]]
+    if asked:
+        out.append("Asked: \"%s\"" % asked)
+    extras = [n for n in brief["order"] if n not in CONTRACT + ("pre-mortem", "log")]
+    for name in CONTRACT + tuple(extras):
+        out += ["", "## %s" % ("Pre-mortem" if name == "pre-mortem" else name.capitalize()),
+                brief["sections"].get(name, "").strip()]
+    out += ["", "## Pre-mortem", premortem.strip(), "", "## Log", log.strip()]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def load_brief(root, relpath):
+    return parse_brief(read_text(rep_path(root, relpath))) if relpath else None
+
+
+def append_log(root, state, line):
+    brief = load_brief(root, state["active"])
+    if not brief:
+        return
+    log = (brief["sections"].get("log", "") + "\n- %s %s" % (stamp(), line)).strip()
+    write_text(rep_path(root, state["active"]),
+               render_brief(brief, brief["sections"].get("pre-mortem", ""), log, brief["asked"]))
+
+
+def _slug(title):
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:48] or "brief"
+
+
+def shape(root, state, args):
+    """The user typed /shape <goal>."""
+    words = args.strip()
+    if words.lower() == "drop":
+        if not state["draft"]:
+            return "[rep] no draft to drop."
+        try:
+            os.remove(rep_path(root, state["draft"]))
+        except OSError:
+            pass
+        state["draft"] = None
+        event(root, "drop_draft")
+        return "[rep] draft dropped by the user."
+    if state["active"]:
+        title = load_brief(root, state["active"])["title"]
+        event(root, "shape", revision=True)
+        return ("[rep] brief \"%s\" is active, so this is a revision request: \"%s\". Draft the whole brief again "
+                "with the change using `rep brief draft`, say what changed, and keep working under the current "
+                "brief until the user approves it." % (title, _clip(words, 300)))
+    if not words:
+        return "[rep] usage: /shape <what you want done>"
+    state.update(asked=_clip(words, 300), runs=[], flakes=0)
+    event(root, "shape", revision=False)
+    return ("[rep] shaping, at the user's request: \"%s\". Follow the shape skill. Write the draft with "
+            "`rep brief draft`; no code edits until the user approves it." % _clip(words, 300))
+
+
+def draft(root, state, text):
+    """The agent wrote a draft. Returns (message, ok)."""
+    brief = parse_brief(text)
+    missing = problems(brief)
+    if missing:
+        return "rep: draft not saved. It needs " + "; ".join(missing) + ".", False
+    active = load_brief(root, state["active"])
+    asked = active["asked"] if active else (state["asked"] or "")
+    os.makedirs(rep_path(root, "briefs"), exist_ok=True)
+    write_text(rep_path(root, "briefs", "draft.md"), render_brief(brief, PREMORTEM_PLACEHOLDER, "", asked))
+    state["draft"] = "briefs/draft.md"
+    event(root, "draft", revision=bool(active))
+    budget = budget_of(brief)
+    kind = "Revision" if active else "Draft"
+    return ("%s saved: \"%s\". Budget %d lines / %d files, check `%s`. Ask the user to approve with "
+            "/approve <their pre-mortem> or to say what to change. Do not edit code until then."
+            % (kind, brief["title"], budget["lines"], budget["files"], check_cmd(brief))), True
+
+
+def approve(root, state, premortem):
+    """The user typed /approve [pre-mortem]."""
+    if not state["draft"]:
+        return "[rep] nothing to approve: there is no draft brief. /shape <goal> starts one."
+    proposed = load_brief(root, state["draft"])
+    missing = problems(proposed)
+    if missing:
+        return "[rep] the draft can't be approved yet. It needs " + "; ".join(missing) + "."
+    premortem = premortem.strip()
+    active = load_brief(root, state["active"])
+    if active:
+        changed = [n.capitalize() for n in CONTRACT
+                   if proposed["sections"].get(n, "").split() != active["sections"].get(n, "").split()]
+        log = active["sections"].get("log", "") + "\n- %s revision approved by the user: %s changed" % (
+            stamp(), ", ".join(changed) or "nothing")
+        write_text(rep_path(root, state["active"]), render_brief(
+            proposed, premortem or active["sections"].get("pre-mortem", ""), log, active["asked"]))
+        message = ("[rep] revision approved by the user (%s changed). Keep working inside the brief."
+                   % (", ".join(changed) or "nothing"))
+    else:
+        base = snapshot(root)
+        name = "%s-%s.md" % (time.strftime("%Y%m%d"), _slug(proposed["title"]))
+        while os.path.exists(rep_path(root, "briefs", name)):
+            name = name[:-3] + "-2.md"
+        log = "- %s approved by the user (base %s)" % (stamp(), base[:7] if base else "none: not a git repo")
+        write_text(rep_path(root, "briefs", name), render_brief(proposed, premortem or "(none)", log, state["asked"]))
+        state.update(active="briefs/" + name, base=base, approved_at=now(), review_at=None, trips=0, refused=0,
+                     over_reported=0, todos={}, hints=0, todo_released=False)
+        budget = budget_of(proposed)
+        message = ("[rep] brief approved by the user: \"%s\". Budget %d lines / %d files, check `%s`.%s Start the work."
+                   % (proposed["title"], budget["lines"], budget["files"], check_cmd(proposed),
+                      "" if base else " Not a git repo, so the budget can't be measured."))
+    try:
+        os.remove(rep_path(root, state["draft"]))
+    except OSError:
+        pass
+    state["draft"] = None
+    event(root, "approve", revision=bool(active), premortem=bool(premortem))
+    return message
+
+
+def facts(root, state):
+    """What the harness knows about the active brief right now."""
+    brief = load_brief(root, state["active"])
+    budget = budget_of(brief)
+    out = {"title": brief["title"], "cmd": check_cmd(brief), "budget": budget, "brief": brief,
+           "files": None, "lines": None, "tree": None, "change_map": {}}
+    if state["base"]:
+        out["tree"] = snapshot(root)
+        out["change_map"] = changes(root, state["base"], out["tree"])
+        out["files"], out["lines"] = size(out["change_map"])
+    runs = state["runs"]
+    last = runs[-1] if runs else None
+    if not last:
+        out["check"] = "check not run yet"
+    elif out["tree"] and last["tree"] != out["tree"]:
+        out["check"] = "code changed since the last check run"
+    else:
+        out["check"] = "check %s on the current code" % ("passing" if last["ok"] else "failing")
+    return out
+
+
+def usage(f):
+    if f["lines"] is None:
+        return "budget not measured (no git)"
+    return "budget %d/%d lines, %d/%d files" % (f["lines"], f["budget"]["lines"], f["files"], f["budget"]["files"])
+
+
+def over_budget(budget, files, lines):
+    return (budget["lines"] is not None and lines > budget["lines"]) or (
+        budget["files"] is not None and files > budget["files"])
+
+
+def in_scope(relpath, paths):
+    import fnmatch
+    return not paths or relpath in NOT_COUNTED or any(
+        relpath == p or relpath.startswith(p + "/") or fnmatch.fnmatch(relpath, p) for p in paths)
+
+
+def review(root, state, args):
+    """The user typed /review, or /review accept|redirect|reject [note]."""
+    if not state["active"]:
+        return "[rep] no active brief to review."
+    word, _, note = args.strip().partition(" ")
+    word, note = word.lower(), note.strip()
+    if word in ("accept", "reject"):
+        return close(root, state, "accepted" if word == "accept" else "rejected", note)
+    if word == "redirect":
+        append_log(root, state, "redirected by the user: %s" % (note or "(no note)"))
+        state["review_at"] = None
+        event(root, "redirect")
+        return "[rep] redirected by the user: \"%s\". Keep working inside the brief." % _clip(note, 300)
+    if word:
+        return "[rep] usage: /review, then /review accept | redirect <what to change> | reject"
+    state["review_at"] = now()
+    event(root, "review_start")
+    return packet(root, state)
+
+
+def packet(root, state):
+    f = facts(root, state)
+    runs = state["runs"]
+    lines = ["[rep] review packet for \"%s\", measured by the harness rather than written by the model. Base %s."
+             % (f["title"], (state["base"] or "none")[:7])]
+    if runs:
+        lines.append("Check `%s`: %d run(s); first run %s; %s; flaky runs: %d." % (
+            f["cmd"], len(runs), "failed (red before green)" if not runs[0]["ok"] else "passed",
+            f["check"], state["flakes"]))
+    else:
+        lines.append("Check `%s`: never run." % f["cmd"])
+    if f["lines"] is not None:
+        verdict = "over budget" if over_budget(f["budget"], f["files"], f["lines"]) else "within budget"
+        lines.append("Size: %d file(s), %d line(s) changed; budget %d files / %d lines, %s. Breaker trips: %d. "
+                     "Edits refused for scope or dependencies: %d." % (
+                         f["files"], f["lines"], f["budget"]["files"], f["budget"]["lines"], verdict,
+                         state["trips"], state["refused"]))
+        listed = sorted(f["change_map"].items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:8]
+        lines += ["  %s +%d -%d" % (p, a, d) for p, (a, d) in listed]
+    premortem = f["brief"]["sections"].get("pre-mortem", "").strip()
+    lines.append("Pre-mortem, written by the user before the work: %s" % (
+        "\"%s\"" % _clip(premortem, 400) if premortem and premortem != "(none)" else "none."))
+    unverified = f["brief"]["fields"].get("unverified")
+    if unverified:
+        lines.append("Not covered by the check, per the brief: %s" % unverified)
+    lines.append("Follow the review skill, then ask the user to decide: /review accept, /review redirect "
+                 "<what to change>, or /review reject.")
+    return "\n".join(lines)
+
+
+def close(root, state, outcome, note):
+    f = facts(root, state)
+    runs = state["runs"]
+    last = runs[-1] if runs else None
+    record = {
+        "id": os.path.basename(state["active"])[:-3], "kind": "brief", "title": f["title"], "outcome": outcome,
+        "note": note, "budget": {"lines": f["budget"]["lines"], "files": f["budget"]["files"]},
+        "actual": {"lines": f["lines"], "files": f["files"]}, "trips": state["trips"], "refused": state["refused"],
+        "check": {"runs": len(runs), "redFirst": (not runs[0]["ok"]) if runs else None, "flakes": state["flakes"],
+                  "passingAtClose": bool(last and last["ok"] and last["tree"] == f["tree"])},
+        "premortem": f["brief"]["sections"].get("pre-mortem", "").strip(), "hintsUsed": state["hints"],
+        "todos": sorted(state["todos"]), "violations": state["violations"],
+        "approvedAt": iso(state["approved_at"]) if state["approved_at"] else None, "createdAt": iso(),
+        "durationS": now() - state["approved_at"] if state["approved_at"] else None,
+    }
+    _append(root, "reps.jsonl", record)
+    append_log(root, state, "closed by the user: %s%s" % (outcome, ": " + note if note else ""))
+    event(root, "close", brief=record["id"], outcome=outcome)
+    if state["draft"]:
+        try:
+            os.remove(rep_path(root, state["draft"]))
+        except OSError:
+            pass
+    fresh = new_state()
+    fresh["region_files"] = state["region_files"]
+    state.clear()
+    state.update(fresh)
+    return "[rep] brief \"%s\" closed by the user: %s. Pins cleared. The next piece of work starts with /shape." % (
+        f["title"], outcome)
+
+
+def record_run(root, state, ok, secs, tree, code):
+    """Store one `rep check` result. Same code with a different result is a flake."""
+    runs = state["runs"]
+    flaky = any(r["tree"] == tree and r["ok"] != ok for r in runs)
+    changed = not runs or runs[-1]["ok"] != ok
+    runs.append({"at": now(), "ok": ok, "secs": round(secs, 2), "tree": tree, "code": code})
+    del runs[:-30]
+    if flaky:
+        state["flakes"] += 1
+    if state["active"] and changed:
+        append_log(root, state, "check %s" % ("passing" if ok else "failing"))
+    event(root, "check", ok=ok, secs=round(secs, 2), flaky=flaky)
+    return flaky
+
+
+def status_line(root, state):
+    """The live state the agent sees on every user turn, or None."""
+    parts = []
+    if state["active"]:
+        f = facts(root, state)
+        parts = ["brief \"%s\"" % f["title"], usage(f), f["check"]]
+        if state["draft"]:
+            parts.append("a revision draft is waiting for the user's /approve")
+        if state["review_at"]:
+            parts.append("review in progress")
+        line = "[rep] " + " · ".join(parts) + ". Run the check with `rep check`; record decisions with `rep note`."
+    elif state["draft"]:
+        title = load_brief(root, state["draft"])["title"]
+        line = "[rep] draft brief \"%s\" is waiting for the user's /approve. Don't edit code until then." % title
+    else:
+        line = None
+    extras = []
+    if state["region_files"] and not state["todo_released"]:
+        extras.append("TODO(human) open in %s (the user's to write; hints %d/%d)" % (
+            ", ".join(state["region_files"]), state["hints"], len(HINTS)))
+    if state["pins"]:
+        extras.append("pinned, read-only for you: %s" % ", ".join(sorted(state["pins"])))
+    if extras:
+        line = (line + " " if line else "[rep] ") + " · ".join(extras) + "."
+    return line
+
+
+def session_context(root, state):
+    """Loaded at the start of every session, after /clear and after compaction."""
+    out = []
+    lessons = [l for l in read_text(os.path.join(root, "lessons.md")).splitlines() if l.startswith("- ")]
+    if lessons:
+        out.append("[rep] lessons.md holds %d lesson(s) from earlier work in this repo. Read it before "
+                   "non-trivial work here." % len(lessons))
+    if state["active"]:
+        text = read_text(rep_path(root, state["active"])).rstrip()
+        head_part, _, log = text.partition("\n## Log")
+        entries = [l for l in log.splitlines() if l.startswith("- ")][-8:]
+        out.append("[rep] Active brief: the user's contract for the current work. You may not edit it; propose "
+                   "changes with `rep brief draft`.\n\n" + head_part.rstrip() + "\n\n## Log (latest)\n"
+                   + "\n".join(entries))
+    line = status_line(root, state)
+    if line:
+        out.append(line)
+    return "\n\n".join(out) or None
+
+
 # --- TODO(human) regions ----------------------------------------------------
 #
 # A region runs from a comment line containing TODO(human) through the next
@@ -273,236 +773,39 @@ def new_regions(before, after):
     return list((Counter(regions(after)) - Counter(regions(before))).elements())
 
 
-def read_text(path):
-    try:
-        if os.path.getsize(path) > MAX_SCAN_BYTES:
-            return ""
-        with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
-            return f.read()
-    except OSError:
-        return ""
-
-
-def write_text(path, text):
-    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
-        f.write(text)
-
-
-def simulate(tool, tool_input, before):
-    """The file's text after this edit, or None when that cannot be worked out.
-
-    Checking the simulated result against the regions that exist now is
-    simpler and stricter than reasoning about where old_string overlaps.
-    """
-    if tool == "Write":
-        return tool_input.get("content") or ""
-    if tool == "Edit":
-        edits = [tool_input]
-    elif tool == "MultiEdit":
-        edits = tool_input.get("edits") or []
-    else:
-        return None
-    text = before
-    for edit in edits:
-        old, new = edit.get("old_string") or "", edit.get("new_string") or ""
-        if not old:
-            if text:
-                return None
-            text = new
-        elif old not in text:
-            return None
-        elif edit.get("replace_all"):
-            text = text.replace(old, new)
-        else:
-            text = text.replace(old, new, 1)
-    return text
-
-
 def refresh_region_files(root, state):
     """Rebuild the list of files that hold regions: the ones already known
     plus whatever git can find, so regions typed by hand are covered too."""
     candidates = set(state.get("region_files") or [])
     if os.path.exists(os.path.join(root, ".git")):
-        import subprocess
-        try:
-            out = subprocess.run(
-                ["git", "-C", root, "grep", "-l", "-I", "--untracked", "-F", "TODO(human)"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, universal_newlines=True)
-            candidates.update(line for line in out.stdout.splitlines() if line)
-        except (OSError, subprocess.SubprocessError):
-            pass
+        _, out = git(root, "grep", "-l", "-I", "--untracked", "-F", "TODO(human)")
+        candidates.update(line for line in out.splitlines() if line)
     state["region_files"] = sorted(
         r for r in candidates
         if not r.startswith(REP_DIR + "/") and regions(read_text(os.path.join(root, r))))
 
 
-# --- protected files during Bash ---------------------------------------------
-
-def protected_files(state):
-    """Map of relpath -> 'region' | 'pin' for what a Bash call must not change."""
-    files = {}
-    if state["dial"] == "dark":
-        return files
-    if not state["work"]["todo_released"]:
-        for r in state.get("region_files") or []:
-            files[r] = "region"
-    for r in state.get("pins") or {}:
-        files[r] = "pin"
-    return files
-
-
-def snap_path(tool_use_id):
-    import tempfile
-    folder = os.path.join(tempfile.gettempdir(), "rep-snap-%d" % os.getuid())
-    os.makedirs(folder, mode=0o700, exist_ok=True)
-    return os.path.join(folder, re.sub(r"\W", "_", tool_use_id or "none") + ".json")
-
-
-def keep_path(root, relpath):
-    import hashlib
-    return rep_path(root, "keep", hashlib.sha1(relpath.encode()).hexdigest()[:16] + ".pre")
-
-
-# --- tasks and reps ---------------------------------------------------------
-
-def open_task(state, session):
-    state["seq"] += 1
-    work = state["work"]
-    if work["goal_session"] != session:
-        # Sessions sharing a checkout share one task, but not each other's words.
-        work["goal"], work["goal_at"], work["asked_at"] = "", None, None
-    state["task"] = {
-        "id": "t%04d" % state["seq"], "goal": work["goal"], "opened_at": now(),
-        "started_at": work["goal_at"] or now(), "session": session, "dial": state["dial"],
-        "predictions": [], "skipped": [], "retro_at": None,
-    }
-    return state["task"]
-
-
-def record_prediction(root, state, text, via, session, waited=True):
-    """Store the user's words verbatim. `waited` is False when the prediction
-    arrived in the same message as the task, so it cost no extra turn."""
-    task = state["task"] or open_task(state, session)
-    work = state["work"]
-    if task["predictions"] and task["predictions"][-1]["text"] == text:
-        # An interrupted prompt that gets resent must not count twice.
-        return "[rep] prediction #%d is already recorded. Edits are unlocked." % len(task["predictions"])
-    asked = work["asked_at"] or work["goal_at"]
-    wait = now() - asked if (waited and asked and not task["predictions"]) else 0
-    if not 0 <= wait <= MAX_WAIT:
-        wait = 0    # the user walked away; that is not time rep cost them
-    task["predictions"].append({"text": text, "at": now(), "via": via, "wait_s": wait})
-    n = len(task["predictions"])
-    event(root, "predict", task=task["id"], n=n, via=via, wait_s=wait)
-    return ("[rep] prediction #%d recorded verbatim by the harness: \"%s\". Edits are unlocked. "
-            "Do not grade or correct it now. Once you have evidence, give a one-line prediction check."
-            % (n, _clip(text, 400)))
-
-
-def close_task(root, state, reason, retro=None):
-    """Write the task's reps to reps.jsonl and reset for the next task.
-
-    Rep lines follow the plan's Rep type (id, taskId, phase, skills,
-    prediction, evidence, outcome, hintsUsed, codified, createdAt) plus a few
-    fields Phase 0 wants to learn from.
-    """
-    task, work = state["task"], state["work"]
-    retro = retro or {}
-    closed = now()
-    skills = retro.get("skills") or []
-    base = {"taskId": task["id"], "dial": task["dial"], "skills": skills}
-
-    def rep(suffix, **fields):
-        row = {"id": "%s.%s" % (task["id"], suffix)}
-        row.update(base)
-        row.update({"prediction": "", "evidence": "", "outcome": None, "hintsUsed": 0, "createdAt": iso(closed)})
-        row.update(fields)
-        _append(root, "reps.jsonl", row)
-
-    grades, evidence = retro.get("grades") or {}, retro.get("evidence") or {}
-    for i, p in enumerate(task["predictions"], 1):
-        rep("p%d" % i, kind="predict", phase="research", prediction=p["text"],
-            evidence=evidence.get(i, ""), outcome=grades.get(i), gradedBy="user" if i in grades else None,
-            via=p["via"], waitS=p["wait_s"], createdAt=iso(p["at"]))
-    if "predict" in task["skipped"] and not task["predictions"]:
-        rep("p0", kind="predict", phase="research", outcome="skipped")
-
-    todo = retro.get("todo")
-    if work["todos"] or todo or "todo" in task["skipped"]:
-        released = work["todo_released"] or todo == "released"
-        files = sorted(set(work["todos"]) | set(state.get("region_files") or []))
-        rep("todo", kind="todo", phase="implement", evidence=", ".join(files),
-            outcome="skipped" if released else ("match" if todo == "done" else None),
-            hintsUsed=work["hints"], rating=retro.get("todo_rating"))
-
-    retro_s = max(0, closed - task["retro_at"]) if task["retro_at"] else 0
-    if reason == "retro":
-        rep("retro", kind="retro", phase="codify", surprise=retro.get("surprise", ""),
-            lesson=retro.get("lesson", ""), codified=retro.get("codified"))
-    else:
-        rep("retro", kind="retro", phase="codify", outcome="skipped")
-
-    predict_s = sum(p["wait_s"] for p in task["predictions"])
-    event(root, "task_close", task=task["id"], reason=reason, goal=task["goal"], dial=task["dial"],
-          openedAt=iso(task["started_at"]), closedAt=iso(closed), durationS=max(0, closed - task["started_at"]),
-          predictWaitS=predict_s, retroS=retro_s, overheadS=predict_s + retro_s,
-          predictions=len(task["predictions"]), skipped=task["skipped"], denials=work["denials"],
-          blocked=work["blocked"], violations=work["violations"], hints=work["hints"],
-          todos=sorted(work["todos"]), pins=sorted(state["pins"]))
-    state["task"], state["work"], state["pins"] = None, new_work(), {}
-    return task["id"]
-
-
-# --- commands the user types (prompt hook) or runs (CLI) ---------------------
-
-def set_dial(root, state, value):
-    value = (value or "").strip().lower()
-    if value not in DIALS:
-        return "[rep] usage: /dial dark|dim|lit (currently %s)." % state["dial"]
-    old, state["dial"] = state["dial"], value
-    event(root, "dial", old=old, new=value, task=(state["task"] or {}).get("id"))
-    if value == "dark" and state.get("region_files") and not state["work"]["todo_released"]:
-        # Dark means every gate is off. Leaving a region locked here would cost a
-        # second command at exactly the moment the user is out of time.
-        skip(root, state, "todo", None)
-    return "[rep] dial: %s -> %s. %s" % (old, value, DIAL_MEANING[value])
-
-
-def skip(root, state, what, session):
-    what = (what or "").strip().lower()
-    if not what:
-        # Bare /skip skips whatever is pending, so the way out is one word under deadline.
-        open_todo = state.get("region_files") and not state["work"]["todo_released"]
-        what = "todo" if (state["task"] and open_todo) else "predict"
-    if what == "todo":
-        state["work"]["todo_released"] = True
-        if state["task"] and "todo" not in state["task"]["skipped"]:
-            state["task"]["skipped"].append("todo")
-        event(root, "skip", what="todo", task=(state["task"] or {}).get("id"))
-        return ("[rep] TODO(human) released by the user for this task (logged as skipped, no penalty). "
-                "You may now complete the marked regions and remove the markers.")
-    if what == "predict":
-        if state["task"]:
-            return ("[rep] nothing to skip: this task already has a prediction or a skip logged. "
-                    "Other skips: /skip todo, /retro skip.")
-        task = open_task(state, session)
-        task["skipped"].append("predict")
-        event(root, "skip", what="predict", task=task["id"])
-        return "[rep] prediction skipped by the user (logged, no penalty). Edits are unlocked."
-    return "[rep] usage: /skip [predict|todo]"
+def skip(root, state):
+    """The user typed /skip: release this brief's TODO(human) regions."""
+    if not state["region_files"] or state["todo_released"]:
+        return "[rep] no open TODO(human) to release."
+    state["todo_released"] = True
+    event(root, "skip", what="todo")
+    return ("[rep] TODO(human) released by the user (logged, no penalty). You may now complete the marked "
+            "regions and remove the markers.")
 
 
 def hint(root, state):
-    if not state.get("region_files"):
+    if not state["region_files"]:
         return "[rep] no open TODO(human) region, so there is nothing to hint."
-    work = state["work"]
-    work["hints"] = min(len(HINTS), work["hints"] + 1)
-    level = work["hints"]
-    name, meaning = HINTS[level - 1]
-    event(root, "hint", level=level, task=(state["task"] or {}).get("id"))
+    state["hints"] = min(len(HINTS), state["hints"] + 1)
+    name, meaning = HINTS[state["hints"] - 1]
+    event(root, "hint", level=state["hints"])
     return ("[rep] hint %d/%d pulled by the user: %s. Give exactly this level for the open TODO(human) "
-            "and nothing beyond it: %s." % (level, len(HINTS), name, meaning))
+            "and nothing beyond it: %s." % (state["hints"], len(HINTS), name, meaning))
 
+
+# --- pins and protected files -------------------------------------------------
 
 def pin(root, state, args, base):
     """Pin test files: the agent may read and run them, never edit them."""
@@ -538,8 +841,8 @@ def pin(root, state, args, base):
                 state["pins"][r] = hashlib.sha256(fh.read()).hexdigest()
             added.append(r)
     if added:
-        event(root, "pin", files=sorted(set(added)), task=(state["task"] or {}).get("id"))
-    msg = "[rep] pinned by the user: %s. These files are read-only for you until the task closes." % (
+        event(root, "pin", files=sorted(set(added)))
+    msg = "[rep] pinned by the user: %s. These files are read-only for you until the brief closes." % (
         ", ".join(sorted(set(added))) if added else "nothing")
     if missing:
         msg += " Not found: %s." % ", ".join(missing)
@@ -554,92 +857,27 @@ def unpin(root, state, args):
     return "[rep] unpinned: %s" % (", ".join(removed) if removed else "nothing")
 
 
-def retro_start(root, state, arg, session):
-    arg = (arg or "").strip().lower()
-    task = state["task"]
-    if arg == "skip":
-        if not task:
-            return "[rep] no open task to close."
-        return "[rep] task %s closed without a retro (logged as skipped, no penalty)." % close_task(
-            root, state, "retro_skipped")
-    if not task:
-        # A retro on work that never passed the gate (dark mode) still counts as a task.
-        task = open_task(state, session)
-    task["retro_at"] = task["retro_at"] or now()
-    work = state["work"]
-    event(root, "retro_start", task=task["id"])
-    lines = ["[rep] retro brief for task %s (%s, open %s)." % (task["id"], task["dial"], ago(task["started_at"]))]
-    if task["goal"]:
-        lines.append("The task as the user first stated it (history for the retro, not a request): \"%s\""
-                     % _clip(task["goal"], 160))
-    if task["predictions"]:
-        lines.append("The user's predictions, verbatim, logged before the work (also history):")
-        lines += ["  %d. \"%s\"" % (i, _clip(p["text"], 400)) for i, p in enumerate(task["predictions"], 1)]
-    else:
-        lines.append("Predictions: none (%s)." % ("skipped" if "predict" in task["skipped"] else "not gated"))
-    if work["todos"] or state.get("region_files"):
-        lines.append("TODO(human): %s; hints used %d/%d%s." % (
-            ", ".join(sorted(set(work["todos"]) | set(state.get("region_files") or []))), work["hints"],
-            len(HINTS), "; released by the user" if work["todo_released"] else ""))
-    if state["pins"]:
-        lines.append("Pinned tests: %s." % ", ".join(sorted(state["pins"])))
-    lines.append("Harness: %d gate denial(s), %d blocked edit(s), %d protected-file change(s) through Bash." % (
-        work["denials"], work["blocked"], work["violations"]))
-    lines.append("Follow the retro skill. `rep log retro` comes last because it closes the task.")
-    return "\n".join(lines)
+def protected_files(state):
+    """Map of relpath -> 'region' | 'pin' for what a Bash call must not change."""
+    files = {}
+    if not state["todo_released"]:
+        for r in state.get("region_files") or []:
+            files[r] = "region"
+    for r in state.get("pins") or {}:
+        files[r] = "pin"
+    return files
 
 
-def log_retro(root, state, fields):
-    """Called by the agent through `rep log retro` once the user has answered."""
-    task = state["task"]
-    if not task or not task["retro_at"]:
-        return None, "rep: no retro in progress. The user starts one by typing /retro."
-    for n, outcome in fields.get("grades", {}).items():
-        if outcome not in OUTCOMES:
-            return None, "rep: grade must be one of %s." % ", ".join(OUTCOMES)
-        if not 1 <= n <= len(task["predictions"]):
-            return None, "rep: task %s has %d prediction(s); cannot grade #%d." % (
-                task["id"], len(task["predictions"]), n)
-    return close_task(root, state, "retro", fields), None
+def snap_path(tool_use_id):
+    import tempfile
+    folder = os.path.join(tempfile.gettempdir(), "rep-snap-%d" % os.getuid())
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    return os.path.join(folder, re.sub(r"\W", "_", tool_use_id or "none") + ".json")
 
 
-def expire_if_stale(root, state):
-    if state["task"] and state["touched_at"] and now() - state["touched_at"] > STALE_SECONDS:
-        return "[rep] task %s sat untouched for over %dh and was closed ungraded." % (
-            close_task(root, state, "expired"), STALE_SECONDS // 3600)
-    return None
-
-
-def status_line(state):
-    """The live state the agent sees on every user turn. None when dark."""
-    dial, task, work = state["dial"], state["task"], state["work"]
-    if dial == "dark":
-        return None
-    if not task:
-        return ("[rep] dial=%s. No prediction logged, so edits are locked. If this message starts a coding task, "
-                "reply first with the prediction ask (one short message, no diagnosis, no plan). The user answers "
-                "with a line starting `predict:` or types /skip. Questions and discussion need no prediction." % dial)
-    parts = ["[rep] dial=%s" % dial, "task %s open %s" % (task["id"], ago(task["started_at"]))]
-    if task["predictions"]:
-        parts.append("%d prediction(s) logged" % len(task["predictions"]))
-    elif "predict" in task["skipped"]:
-        parts.append("prediction skipped")
-    if state.get("region_files") and not work["todo_released"]:
-        parts.append("TODO(human) open in %s (the user's to write; hints %d/%d)" % (
-            ", ".join(state["region_files"]), work["hints"], len(HINTS)))
-    if state["pins"]:
-        parts.append("pinned, read-only for you: %s" % ", ".join(sorted(state["pins"])))
-    elif dial == "lit":
-        parts.append("lit and nothing pinned yet: the user owns the tests, so draft or request them "
-                     "and have the user /pin them before you implement")
-    if task["retro_at"]:
-        parts.append("retro in progress")
-    return " · ".join(parts) + "."
-
-
-def _clip(text, limit):
-    text = " ".join((text or "").split())
-    return text if len(text) <= limit else text[:limit - 1] + "…"
+def keep_path(root, relpath):
+    import hashlib
+    return rep_path(root, "keep", hashlib.sha1(relpath.encode()).hexdigest()[:16] + ".pre")
 
 
 # --- hook plumbing ----------------------------------------------------------
@@ -683,10 +921,15 @@ def block(reason):
     sys.exit(0)
 
 
+def tell_user(text):
+    print(json.dumps({"systemMessage": text}))
+    sys.exit(0)
+
+
 def run(main):
     """Entry point for every hook script. A hook that crashes inside a
     rep-enabled repo denies the tool call: failing open would be a silent
-    bypass, and Phase 0 is judged on never having one."""
+    bypass."""
     ev = {}
     try:
         ev = json.load(sys.stdin)
