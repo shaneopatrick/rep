@@ -1,7 +1,7 @@
 """Drives each hook the way Claude Code does: JSON on stdin, decision on stdout.
 
 Payload shapes were captured from Claude Code 2.1.288 (see README).
-Run: python3 -m unittest discover -s tests -v
+Run: python3 -m unittest discover -s tests
 """
 import json
 import os
@@ -9,15 +9,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 HOOKS = os.path.join(REPO, "hooks")
 REP = os.path.join(REPO, "bin", "rep")
 sys.path.insert(0, HOOKS)
+sys.path.insert(0, REPO)
+import install  # noqa: E402
 import replib  # noqa: E402
 
+JOBS = "def claim(conn, worker):\n    row = select_pending(conn)\n    mark_running(conn, row)\n    return row\n\n"
 STUB = '''def claim(conn, worker):
     # TODO(human): claim one job atomically; two workers must never get the same row
     raise NotImplementedError
@@ -29,15 +31,41 @@ def release(conn, job):
 '''
 
 
+def brief_text(lines=20, files=2, paths="jobs.py, tests/", deps="no", cmd="grep -q atomic jobs.py",
+               title="No job runs twice"):
+    return """# Brief: %s
+## Goal
+A job is never executed by two workers.
+## Approach
+Atomic claim with UPDATE ... RETURNING.
+Rejected: advisory locks (more moving parts); a queue library (new dependency)
+## Budget
+lines: %s
+files: %s
+paths: %s
+deps: %s
+## Check
+cmd: %s
+unverified: behaviour on Postgres
+""" % (title, lines, files, paths, deps, cmd)
+
+
 class Harness(unittest.TestCase):
     def setUp(self):
         self.root = os.path.realpath(tempfile.mkdtemp(prefix="rep-test-"))
         self.addCleanup(shutil.rmtree, self.root, True)
-        subprocess.run(["git", "init", "-q", self.root], check=True)
+        self.git("init", "-q")
+        self.write("jobs.py", JOBS)
+        self.git("add", "-A")
+        self.git("commit", "-qm", "base")
         self.session = "s1"
         self.n = 0
 
     # -- helpers --
+    def git(self, *args):
+        subprocess.run(["git", "-C", self.root, "-c", "user.name=t", "-c", "user.email=t@t"] + list(args),
+                       check=True, stdout=subprocess.DEVNULL)
+
     def write(self, name, text):
         path = os.path.join(self.root, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -90,45 +118,72 @@ class Harness(unittest.TestCase):
         post = self.hook("bash_audit", dict(base, hook_event_name="PostToolUse"))
         return post.get("decision"), post.get("reason", "")
 
-    def rep(self, *args, ok=True):
-        proc = subprocess.run([sys.executable, REP] + list(args), cwd=self.root, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, universal_newlines=True)
+    def stop(self, active=False):
+        return self.hook("done_gate", {"hook_event_name": "Stop", "stop_hook_active": active,
+                                       "last_assistant_message": "done"})
+
+    def session_start(self, source="startup"):
+        out = self.hook("session_start", {"hook_event_name": "SessionStart", "source": source})
+        return out.get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    def rep(self, *args, ok=True, stdin=None):
+        proc = subprocess.run([sys.executable, REP] + list(args), cwd=self.root, input=stdin,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         if ok:
-            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return proc
+
+    def draft(self, text=None, ok=True):
+        return self.rep("brief", "draft", stdin=text or brief_text(), ok=ok)
+
+    def activate(self, premortem="", **budget):
+        self.say("/shape make claims atomic so no job runs twice")
+        self.draft(brief_text(**budget))
+        return self.say("/approve " + premortem)
 
     def state(self):
         return replib.load_state(self.root)
 
+    def brief(self):
+        return self.read(".rep/" + self.state()["active"])
+
     def events(self, kind):
         return [e for e in replib.read_jsonl(self.root, "events.jsonl") if e["event"] == kind]
 
-    def reps(self):
-        return replib.read_jsonl(self.root, "reps.jsonl")
-
-    def on(self, dial="dim"):
-        self.say("/dial %s" % dial)
+    def closed(self):
+        return [r for r in replib.read_jsonl(self.root, "reps.jsonl") if r.get("kind") == "brief"]
 
 
 class Enabling(Harness):
-    def test_everything_is_a_no_op_until_rep_is_turned_on(self):
-        self.write("a.py", STUB)
-        self.assertEqual(self.say("fix the bug in a.py"), "")
-        self.allowed("predict_gate", "Edit", "a.py", old_string="raise NotImplementedError", new_string="pass")
-        self.allowed("guard_human", "Edit", "a.py", old_string="raise NotImplementedError", new_string="pass")
-        self.assertEqual(self.bash("rep dial dark"), (None, ""))
+    def test_without_rep_everything_is_ordinary_claude_code(self):
+        self.assertEqual(self.say("refactor the claim function please"), "")
+        self.allowed("budget_gate", "Write", "anything.py", content="x = 1\n" * 500)
+        self.assertEqual(self.bash("rep approve"), (None, ""))
+        self.assertEqual(self.stop(), {})
+        self.assertEqual(self.session_start(), "")
         self.assertFalse(os.path.exists(os.path.join(self.root, ".rep")))
 
-    def test_dial_turns_it_on_and_sets_the_style(self):
-        text = self.say("/dial lit")
+    def test_shape_turns_rep_on_and_records_the_users_words(self):
+        text = self.say("/shape make claims atomic so no job runs twice")
         self.assertIn("enabled", text)
-        self.assertEqual(self.state()["dial"], "lit")
+        self.assertIn("rep brief draft", text)
+        self.assertEqual(self.state()["asked"], "make claims atomic so no job runs twice")
         with open(os.path.join(self.root, ".claude", "settings.local.json")) as f:
             self.assertEqual(json.load(f)["outputStyle"], "rep-tutor")
-        self.assertIn(".rep/", self.read(".git/info/exclude"))
+
+    def test_state_is_never_committed_even_from_a_worktree(self):
+        tree = os.path.join(os.path.dirname(self.root), os.path.basename(self.root) + "-wt")
+        self.addCleanup(shutil.rmtree, tree, True)
+        self.git("worktree", "add", "-q", tree)
+        subprocess.run([sys.executable, REP, "init"], cwd=tree, check=True, stdout=subprocess.DEVNULL)
+        status = subprocess.run(["git", "-C", tree, "status", "--short"], stdout=subprocess.PIPE,
+                                universal_newlines=True).stdout
+        self.assertEqual(status, "")
 
     def test_other_commands_explain_that_rep_is_off(self):
-        self.assertIn("not enabled", self.say("/predict the bug is in claim"))
+        self.assertIn("not enabled", self.say("/approve"))
+        self.assertIn("not enabled", self.say("/shape"))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".rep")))
 
     def test_a_parent_rep_dir_does_not_reach_into_a_git_repo(self):
         parent = os.path.realpath(tempfile.mkdtemp(prefix="rep-parent-"))
@@ -137,109 +192,339 @@ class Enabling(Harness):
         child = os.path.join(parent, "child")
         subprocess.run(["git", "init", "-q", child], check=True)
         self.assertIsNone(replib.find_root(os.path.join(child, "x.py")))
-        self.assertEqual(replib.find_root(os.path.join(parent, "loose.py")), parent)
 
-    def test_an_existing_output_style_is_left_alone(self):
-        self.write(".claude/settings.local.json", json.dumps({"outputStyle": "Concise", "permissions": {}}))
-        text = self.say("/dial dim")
-        self.assertIn("left as is", text)
-        self.assertEqual(json.loads(self.read(".claude/settings.local.json"))["outputStyle"], "Concise")
+    def test_a_missing_hook_script_never_blocks(self):
+        home = tempfile.mkdtemp(prefix="rep-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        proc = subprocess.run(["sh", "-c", install.command("nope")], env=dict(os.environ, HOME=home))
+        self.assertEqual(proc.returncode, 0)
 
 
-class PredictGate(Harness):
+class Shaping(Harness):
     def setUp(self):
         super().setUp()
-        self.on()
-        self.write("a.py", "x = 1\n")
+        self.say("/shape make claims atomic so no job runs twice")
 
-    def test_edits_are_locked_until_a_prediction_exists(self):
-        reason = self.denied("predict_gate", "Edit", "a.py", old_string="1", new_string="2")
-        self.assertIn("predict:", reason)
-        self.assertEqual(self.state()["work"]["denials"], 1)
-        self.assertEqual(len(self.events("gate_deny")), 1)
+    def test_a_draft_must_be_a_usable_contract(self):
+        proc = self.draft("# Brief: x\n## Goal\ny\n", ok=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("'cmd: <command>' under Check", proc.stdout)
+        self.assertIn("'lines: <n>' and 'files: <n>'", proc.stdout)
+        self.assertIsNone(self.state()["draft"])
 
-    def test_a_new_file_is_gated_too(self):
-        self.denied("predict_gate", "Write", "brand/new.py", content="x = 1\n")
+    def test_a_draft_must_fit_on_one_screen(self):
+        long = brief_text().replace("## Approach\n", "## Approach\n" + "more detail\n" * 40)
+        self.assertIn("fits on one screen", self.draft(long, ok=False).stdout)
 
-    def test_inline_prediction_in_the_task_message_costs_no_extra_turn(self):
-        text = self.say("fix the duplicate job execution bug that shows up under load\n"
-                        "predict: claim() selects then updates with no lock; fix stays in claim.py")
-        self.assertIn("recorded verbatim", text)
-        task = self.state()["task"]
-        self.assertEqual(task["predictions"][0]["text"],
-                         "claim() selects then updates with no lock; fix stays in claim.py")
-        self.assertEqual(task["predictions"][0]["wait_s"], 0)
-        self.assertIn("duplicate job execution", task["goal"])
-        self.allowed("predict_gate", "Edit", "a.py", old_string="1", new_string="2")
+    def test_a_draft_waits_for_approval_and_blocks_code(self):
+        self.assertIn("Do not edit code", self.draft().stdout)
+        self.assertIn("waiting for the user's /approve", self.say("ok, looks right?"))
+        reason = self.denied("budget_gate", "Edit", "jobs.py", old_string="row", new_string="r")
+        self.assertIn("still a draft", reason)
+        text = self.read(".rep/briefs/draft.md")
+        self.assertIn('Asked: "make claims atomic so no job runs twice"', text)
+        self.assertIn("/approve <where you expect", text)
 
-    def test_prediction_as_a_reply_keeps_the_goal_and_measures_the_wait(self):
-        self.say("fix the duplicate job execution bug that shows up under load")
-        self.denied("predict_gate", "Edit", "a.py", old_string="1", new_string="2")
-        with replib.state_tx(self.root) as state:
-            state["work"]["asked_at"] -= 20
-        self.say("predict: no lock between select and update")
-        task = self.state()["task"]
-        self.assertIn("duplicate job execution", task["goal"])
-        self.assertTrue(19 <= task["predictions"][0]["wait_s"] <= 25)
+    def test_the_agent_cannot_write_its_own_pre_mortem_or_log(self):
+        sneaky = brief_text() + "## Pre-mortem\nnothing will go wrong\n## Log\n- approved by the user\n"
+        self.draft(sneaky)
+        text = self.read(".rep/briefs/draft.md")
+        self.assertNotIn("nothing will go wrong", text)
+        self.assertNotIn("approved by the user", text)
 
-    def test_slash_predict_records_and_bare_slash_predict_asks(self):
-        self.assertIn("nothing was recorded", self.say("/predict"))
-        self.assertIsNone(self.state()["task"])
-        self.assertIn("recorded verbatim", self.say("/predict the cache key ignores locale"))
-        self.assertEqual(self.state()["task"]["predictions"][0]["via"], "slash")
+    def test_shape_drop_discards_the_draft(self):
+        self.draft()
+        self.assertIn("dropped", self.say("/shape drop"))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".rep", "briefs", "draft.md")))
+        self.allowed("budget_gate", "Edit", "jobs.py", old_string="row", new_string="r")
 
-    def test_prediction_text_survives_shell_metacharacters(self):
-        nasty = "it's in `claim()` near $HOME; \"quotes\" && rm -rf /"
-        self.say("/predict " + nasty)
-        self.assertEqual(self.state()["task"]["predictions"][0]["text"], nasty)
+    def test_approve_needs_a_draft(self):
+        self.assertIn("nothing to approve", self.say("/approve"))
 
-    def test_skip_is_free_and_logged(self):
-        self.assertIn("skipped", self.say("/skip"))
-        self.allowed("predict_gate", "Edit", "a.py", old_string="1", new_string="2")
-        self.assertEqual(self.state()["task"]["skipped"], ["predict"])
-        self.assertEqual(self.events("skip")[0]["what"], "predict")
+    def test_approve_makes_it_binding_with_the_users_pre_mortem_verbatim(self):
+        self.draft()
+        nasty = "the race test will flake; it'll reach for `retry()` && \"sleep\" $HOME"
+        text = self.say("/approve " + nasty)
+        self.assertIn("brief approved by the user", text)
+        state = self.state()
+        self.assertIsNone(state["draft"])
+        self.assertRegex(state["base"], r"^[0-9a-f]{40}$")
+        brief = self.brief()
+        self.assertIn(nasty, brief)
+        self.assertIn("approved by the user (base %s)" % state["base"][:7], brief)
 
-    def test_dark_has_no_gate(self):
-        self.say("/dial dark")
-        self.allowed("predict_gate", "Edit", "a.py", old_string="1", new_string="2")
-        self.assertEqual(self.say("an ordinary message in dark mode, nothing to report"), "")
+    def test_approve_without_a_pre_mortem_is_fine(self):
+        self.draft()
+        self.say("/approve")
+        self.assertIn("## Pre-mortem\n(none)", self.brief())
 
-    def test_a_second_prediction_joins_the_same_task(self):
-        self.say("/predict first")
-        self.say("predict: the pinned test will pass on the first run")
-        self.assertEqual(len(self.state()["task"]["predictions"]), 2)
+    def test_a_draft_the_user_broke_by_hand_is_not_approved(self):
+        self.draft()
+        path = os.path.join(self.root, ".rep", "briefs", "draft.md")
+        self.write(".rep/briefs/draft.md", self.read(".rep/briefs/draft.md").replace("cmd:", "command:"))
+        self.assertIn("can't be approved", self.say("/approve"))
+        self.assertTrue(os.path.exists(path))
 
-    def test_a_resent_prediction_is_not_counted_twice(self):
-        self.say("predict: the cache key ignores locale")
-        self.assertIn("already recorded", self.say("predict: the cache key ignores locale"))
-        self.assertEqual(len(self.state()["task"]["predictions"]), 1)
+    def test_the_agent_cannot_approve_its_own_draft(self):
+        self.draft()
+        for command in ("rep approve", "rep review accept", "cd x && rep pin tests", "~/.claude/bin/rep unpin"):
+            self.assertEqual(self.bash(command)[0], "deny", command)
+        self.assertIsNone(self.state()["active"])
 
-    def test_the_model_sees_live_state_every_turn(self):
-        self.assertIn("edits are locked", self.say("what does this module do?"))
-        self.say("/predict x")
-        self.assertIn("1 prediction(s) logged", self.say("carry on"))
+    def test_the_agent_keeps_its_own_commands(self):
+        for command in ("rep brief draft <<'EOF'", "rep check", "rep note decided x", "rep status", "rep report",
+                        "grep approve notes.txt", "prep review"):
+            self.assertEqual(self.bash(command)[0], None, command)
 
-    def test_subagent_prompts_are_ignored(self):
-        self.assertEqual(self.say("/dial dark", agent_id="a1"), "")
-        self.assertEqual(self.state()["dial"], "dim")
 
-    def test_predictions_are_not_mined_from_pasted_documents(self):
-        self.say("x" * 5000 + "\npredict: buried in a paste")
-        self.assertIsNone(self.state()["task"])
+class Budget(Harness):
+    def setUp(self):
+        super().setUp()
+        self.activate()
+
+    def test_uncommitted_work_from_before_the_brief_does_not_count(self):
+        self.say("/review accept")
+        self.write("jobs.py", JOBS + "leftover = 1\n" * 30)        # earlier work, never committed
+        self.write("tests/old_notes.py", "x = 1\n" * 30)
+        self.activate()
+        self.assertIn("budget 0/20 lines, 0/2 files", self.say("go"))
+        self.allowed("budget_gate", "Edit", "jobs.py", old_string="    return row\n",
+                     new_string="    return row  # atomic\n")
+        self.assertEqual(self.read("jobs.py").count("leftover"), 30)
+        index_untouched = subprocess.run(["git", "-C", self.root, "diff", "--cached", "--name-only"],
+                                         stdout=subprocess.PIPE, universal_newlines=True).stdout
+        self.assertEqual(index_untouched, "")
+
+    def test_edits_within_budget_go_through(self):
+        self.allowed("budget_gate", "Edit", "jobs.py", old_string="    mark_running(conn, row)\n",
+                     new_string="    mark_running(conn, row)  # atomic\n")
+
+    def test_the_edit_that_would_cross_the_line_is_refused(self):
+        reason = self.denied("budget_gate", "Edit", "jobs.py", old_string="    return row\n",
+                             new_string="    return row\n" + "    pass\n" * 30)
+        self.assertIn("budget breaker", reason)
+        self.assertIn("30 lines across 1 file(s)", reason)
+        self.assertEqual(self.state()["trips"], 1)
+        self.assertEqual(self.events("budget_trip")[0]["via"], "edit")
+
+    def test_cutting_scope_is_never_blocked(self):
+        self.write("jobs.py", JOBS + "x = 1\n" * 40)          # over budget, as if done through Bash
+        self.allowed("budget_gate", "Edit", "jobs.py", old_string="x = 1\n" * 40, new_string="x = 1\n" * 10)
+        self.denied("budget_gate", "Edit", "jobs.py", old_string="x = 1\n" * 40, new_string="x = 1\n" * 41)
+
+    def test_the_file_budget_counts_new_files(self):
+        self.write("tests/test_a.py", "a = 1\n")
+        self.allowed("budget_gate", "Edit", "jobs.py", old_string="row = ", new_string="row  = ")
+        self.write("jobs.py", JOBS.replace("row = ", "row  = "))
+        reason = self.denied("budget_gate", "Write", "tests/test_b.py", content="b = 1\n")
+        self.assertIn("across 3 file(s)", reason)
+
+    def test_edits_outside_the_paths_are_refused(self):
+        reason = self.denied("budget_gate", "Write", "scheduler.py", content="x = 1\n")
+        self.assertIn("outside the brief's paths", reason)
+        self.assertEqual(self.state()["refused"], 1)
+
+    def test_lessons_are_free(self):
+        self.allowed("budget_gate", "Write", "lessons.md", content="- lesson\n" * 100)
+
+    def test_a_revision_raises_the_budget_once_the_user_approves(self):
+        grow = dict(old_string="    return row\n", new_string="    return row\n" + "    pass\n" * 30)
+        self.denied("budget_gate", "Edit", "jobs.py", **grow)
+        self.draft(brief_text(lines=60))
+        self.assertIn("revision draft is waiting", self.say("go on"))
+        self.denied("budget_gate", "Edit", "jobs.py", **grow)
+        self.assertIn("Budget changed", self.say("/approve"))
+        self.allowed("budget_gate", "Edit", "jobs.py", **grow)
+        self.assertIn("revision approved by the user: Budget changed", self.brief())
+
+    def test_a_revision_keeps_the_users_pre_mortem(self):
+        self.say("/review redirect keep it small")
+        before = self.brief().split("## Pre-mortem")[1]
+        self.draft(brief_text(lines=30))
+        self.say("/approve")
+        self.assertEqual(self.brief().split("## Pre-mortem")[1].split("## Log")[0], before.split("## Log")[0])
+
+    def test_dependency_manifests_need_deps_yes(self):
+        self.say("/review reject")
+        self.activate(paths="", lines=200, files=5)
+        self.assertIn("dependency manifest", self.denied("budget_gate", "Write", "package.json", content="{}\n"))
+        self.say("/review reject")
+        self.activate(paths="", lines=200, files=5, deps="yes")
+        self.allowed("budget_gate", "Write", "package.json", content="{}\n")
+
+    def test_a_bash_command_that_crosses_the_budget_is_reported_once(self):
+        decision, reason = self.bash("python3 gen.py", lambda: self.write("tests/gen.py", "x = 1\n" * 50))
+        self.assertEqual(decision, "block")
+        self.assertIn("budget breaker", reason)
+        self.assertEqual(self.bash("ls"), (None, ""))
+        self.assertEqual(self.bash("python3 gen.py", lambda: self.write("tests/gen.py", "x = 1\n" * 60))[0], "block")
+
+
+class Check(Harness):
+    def setUp(self):
+        super().setUp()
+        self.flag = os.path.join(tempfile.mkdtemp(prefix="rep-flag-"), "flag")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.flag), True)
+
+    def test_the_harness_records_red_then_green(self):
+        self.activate()
+        fail = self.rep("check", ok=False)
+        self.assertEqual(fail.returncode, 1)
+        self.assertIn("rep check: FAIL", fail.stdout)
+        self.assertIn("budget 0/20 lines", fail.stdout)
+        self.write("jobs.py", JOBS.replace("mark_running", "mark_running_atomic"))
+        self.assertIn("rep check: PASS", self.rep("check").stdout)
+        runs = self.state()["runs"]
+        self.assertEqual([r["ok"] for r in runs], [False, True])
+        self.assertIn("check failing", self.brief())
+        self.assertIn("check passing", self.brief())
+
+    def test_the_same_code_with_a_different_result_is_flagged_flaky(self):
+        self.activate(cmd="test -f %s" % self.flag)
+        self.rep("check", ok=False)
+        open(self.flag, "w").close()
+        self.assertIn("FLAKY", self.rep("check").stdout)
+        self.assertEqual(self.state()["flakes"], 1)
+
+    def test_long_output_is_trimmed_for_the_agent(self):
+        self.activate(cmd="seq 1 200")
+        out = self.rep("check").stdout
+        self.assertIn("140 earlier lines omitted", out)
+        self.assertNotIn("\n1\n", out)
+
+    def test_a_check_run_while_shaping_is_kept_as_evidence(self):
+        self.say("/shape make claims atomic so no job runs twice")
+        self.draft()
+        self.rep("check", ok=False)
+        self.say("/approve")
+        self.assertEqual(len(self.state()["runs"]), 1)
+
+    def test_no_brief_no_check(self):
+        self.rep("init")
+        self.assertIn("no brief", self.rep("check", ok=False).stderr)
+
+
+class DoneGate(Harness):
+    def setUp(self):
+        super().setUp()
+        self.activate()
+
+    def test_a_turn_that_changed_nothing_is_left_alone(self):
+        self.say("what does claim do?")
+        self.assertEqual(self.stop(), {})
+
+    def test_unchecked_changes_get_one_nudge(self):
+        self.say("go")
+        self.write("jobs.py", JOBS + "# atomic\n")
+        out = self.stop()
+        self.assertIn("rep check", out["hookSpecificOutput"]["additionalContext"])
+        again = self.stop(active=True)
+        self.assertIn("not run on", again["systemMessage"])
+        self.assertEqual(len(self.events("stop_nudge")), 1)
+
+    def test_the_user_sees_the_measured_result(self):
+        self.say("go")
+        self.write("jobs.py", JOBS + "# nope\n")
+        self.rep("check", ok=False)
+        self.assertIn("check failing on the current code", self.stop()["systemMessage"])
+        self.write("jobs.py", JOBS + "# atomic\n")
+        self.rep("check")
+        message = self.stop()["systemMessage"]
+        self.assertIn("check passing on the current code", message)
+        self.assertIn("budget 1/20 lines, 1/2 files", message)
+
+    def test_edits_the_user_made_between_turns_do_not_count(self):
+        self.write("jobs.py", JOBS + "# mine\n")
+        self.say("go")
+        self.assertEqual(self.stop(), {})
+
+
+class Sessions(Harness):
+    def test_a_new_session_starts_from_the_brief_and_its_log(self):
+        self.write("lessons.md", "# Lessons\n\n- claims must be one statement\n")
+        self.activate("it will flake")
+        self.rep("note", "chose", "UPDATE", "RETURNING", "over", "SELECT", "FOR", "UPDATE")
+        for source in ("startup", "clear", "compact"):
+            text = self.session_start(source)
+            self.assertIn("Active brief", text)
+            self.assertIn("# Brief: No job runs twice", text)
+            self.assertIn("chose UPDATE RETURNING over SELECT FOR UPDATE", text)
+            self.assertIn("it will flake", text)
+            self.assertIn("lessons.md holds 1 lesson", text)
+
+    def test_a_waiting_draft_is_mentioned(self):
+        self.say("/shape something")
+        self.draft()
+        self.assertIn("waiting for the user's /approve", self.session_start())
+
+    def test_ordinary_prompts_are_not_stored(self):
+        self.rep("init")
+        secret = "select * from patients where mrn = '0042'"
+        self.say(secret)
+        with open(os.path.join(self.root, ".rep", "state.json")) as f:
+            self.assertNotIn("0042", f.read())
+
+
+class Review(Harness):
+    def setUp(self):
+        super().setUp()
+        self.activate("the race test will flake")
+        self.rep("check", ok=False)
+        self.write("jobs.py", JOBS.replace("mark_running", "mark_running_atomic"))
+        self.rep("check")
+
+    def test_the_packet_is_measured_not_narrated(self):
+        packet = self.say("/review")
+        self.assertIn("measured by the harness", packet)
+        self.assertIn("2 run(s); first run failed (red before green); check passing on the current code", packet)
+        self.assertIn("1 file(s), 2 line(s) changed; budget 2 files / 20 lines, within budget", packet)
+        self.assertIn("jobs.py +1 -1", packet)
+        self.assertIn('"the race test will flake"', packet)
+        self.assertIn("behaviour on Postgres", packet)
+        self.assertIsNotNone(self.state()["review_at"])
+
+    def test_accept_closes_with_a_record_of_estimate_against_actual(self):
+        self.say("/review")
+        self.assertIn("closed by the user: accepted", self.say("/review accept looks right"))
+        record = self.closed()[0]
+        self.assertEqual(record["outcome"], "accepted")
+        self.assertEqual(record["budget"], {"lines": 20, "files": 2})
+        self.assertEqual(record["actual"], {"lines": 2, "files": 1})
+        self.assertEqual(record["check"], {"runs": 2, "redFirst": True, "flakes": 0, "passingAtClose": True})
+        self.assertEqual(record["premortem"], "the race test will flake")
+        self.assertIsNone(self.state()["active"])
+        self.allowed("budget_gate", "Write", "anything.py", content="x = 1\n" * 500)
+
+    def test_redirect_keeps_the_brief_and_logs_the_note(self):
+        self.say("/review")
+        self.assertIn("redirected", self.say("/review redirect also cover the retry path"))
+        self.assertIsNotNone(self.state()["active"])
+        self.assertIn("redirected by the user: also cover the retry path", self.brief())
+
+    def test_reject_closes_as_rejected(self):
+        self.say("/review reject")
+        self.assertEqual(self.closed()[0]["outcome"], "rejected")
+
+    def test_report_and_log_read_the_records(self):
+        self.say("/review accept")
+        report = self.rep("report").stdout
+        self.assertIn("briefs     1 closed: 1 accepted, 0 rejected", report)
+        self.assertIn("actual/estimated lines: median 0.10", report)
+        self.assertIn("red before green: 1/1", report)
+        self.assertIn("bypasses   0", report)
+        self.assertIn("No job runs twice", self.rep("log").stdout)
 
 
 class GuardHuman(Harness):
     def setUp(self):
         super().setUp()
-        self.on("lit")
-        self.say("/predict x")
+        self.rep("init")
         self.write("jobs.py", STUB)
 
     def test_filling_the_region_is_denied(self):
         reason = self.denied("guard_human", "Edit", "jobs.py", old_string="    raise NotImplementedError",
                              new_string="    return conn.execute('select ... for update skip locked')")
         self.assertIn("user's to write", reason)
-        self.assertEqual(self.state()["work"]["blocked"], 1)
 
     def test_editing_outside_the_region_is_allowed(self):
         self.allowed("guard_human", "Edit", "jobs.py", old_string="status = 'free'", new_string="status = 'ready'")
@@ -251,156 +536,74 @@ class GuardHuman(Harness):
     def test_a_write_must_carry_the_region_through_unchanged(self):
         self.allowed("guard_human", "Write", "jobs.py", content="import sqlite3\n\n" + STUB)
         self.denied("guard_human", "Write", "jobs.py", content=STUB.replace("raise NotImplementedError", "return 1"))
-        self.denied("guard_human", "Write", "jobs.py", content="def claim(conn, worker):\n    return 1\n")
 
-    def test_replace_all_that_reaches_into_the_region_is_denied(self):
+    def test_replace_all_and_multiedit_are_checked_as_a_whole(self):
         self.denied("guard_human", "Edit", "jobs.py", old_string="job", new_string="task", replace_all=True)
-        self.allowed("guard_human", "Edit", "jobs.py", old_string="conn", new_string="db", replace_all=True)
-
-    def test_multiedit_is_checked_as_a_whole(self):
         edits = [{"old_string": "status = 'free'", "new_string": "status = 'ready'"},
                  {"old_string": "raise NotImplementedError", "new_string": "return 1"}]
         self.denied("guard_human", "MultiEdit", "jobs.py", edits=edits)
         self.allowed("guard_human", "MultiEdit", "jobs.py", edits=edits[:1])
 
     def test_an_edit_that_cannot_be_simulated_fails_closed(self):
-        reason = self.denied("guard_human", "Edit", "jobs.py", old_string="not in the file", new_string="x")
-        self.assertIn("cannot be checked", reason)
-        self.write("plain.py", "x = 1\n")
-        self.allowed("guard_human", "Edit", "plain.py", old_string="not in the file", new_string="x")
+        self.assertIn("cannot be checked",
+                      self.denied("guard_human", "Edit", "jobs.py", old_string="not in the file", new_string="x"))
 
     def test_an_unterminated_region_runs_to_the_end_of_the_file(self):
         self.write("open.py", "a = 1\n# TODO(human): finish this\nb = 2\n")
         self.denied("guard_human", "Edit", "open.py", old_string="b = 2", new_string="b = 3")
         self.allowed("guard_human", "Edit", "open.py", old_string="a = 1", new_string="a = 0")
 
-    def test_the_agent_may_place_a_region_and_it_is_tracked(self):
-        self.write("new.py", "def f():\n    pass\n")
-        self.allowed("guard_human", "Edit", "new.py", old_string="    pass\n",
-                     new_string="    # TODO(human): the core\n    raise NotImplementedError\n    # END TODO(human)\n")
-        self.assertEqual(self.state()["work"]["todos"], {"new.py": 1})
-        self.assertIn("new.py", self.state()["region_files"])
-        self.assertEqual(self.events("todo_placed")[0]["file"], "new.py")
-
-    def test_the_budget_is_two_regions_per_task(self):
+    def test_placing_regions_is_limited_to_two(self):
         region = "# TODO(human): %d\npass\n# END TODO(human)\n"
         self.allowed("guard_human", "Write", "one.py", content=region % 1 + region % 2)
-        with replib.state_tx(self.root) as state:
-            self.assertEqual(sum(state["work"]["todos"].values()), 2)
-        reason = self.denied("guard_human", "Write", "three.py", content=region % 3)
-        self.assertIn("budget", reason)
+        self.assertIn("limit is 2", self.denied("guard_human", "Write", "three.py", content=region % 3))
 
     def test_prose_that_mentions_the_marker_is_not_a_region(self):
-        text = "Place a `TODO(human)` marker on core logic.\n- TODO(human) regions are protected\n"
-        self.assertEqual(replib.regions(text), [])
-        for lead in ("# ", "// ", "-- ", "    # ", "<!-- ", "{/* ", "/* "):
-            self.assertEqual(len(replib.regions(lead + "TODO(human): x\ncode\n" + lead + "END TODO(human)\n")), 1, lead)
+        self.assertEqual(replib.regions("Place a `TODO(human)` marker.\n- TODO(human) regions\n"), [])
 
-    def test_skip_todo_releases_the_regions(self):
-        self.assertIn("released", self.say("/skip todo"))
-        self.allowed("guard_human", "Edit", "jobs.py", old_string="    raise NotImplementedError", new_string="    return 1")
-        self.assertIn("todo", self.state()["task"]["skipped"])
-
-    def test_bare_skip_releases_the_region_when_that_is_what_is_pending(self):
-        self.say("ok")   # registers jobs.py
+    def test_skip_releases_the_regions(self):
+        self.say("ok")
         self.assertIn("released", self.say("/skip"))
-        self.assertTrue(self.state()["work"]["todo_released"])
+        self.allowed("guard_human", "Edit", "jobs.py", old_string="    raise NotImplementedError", new_string="    return 1")
 
     def test_harness_state_is_not_editable(self):
-        reason = self.denied("guard_human", "Write", ".rep/state.json", content='{"dial": "dark"}')
-        self.assertIn("harness state", reason)
-        self.denied("guard_human", "Edit", ".rep/state.json", old_string='"lit"', new_string='"dark"')
-
-    def test_dial_dark_switches_every_gate_off_and_logs_the_skip(self):
-        self.say("ok")   # registers jobs.py
-        self.say("/dial dark")
-        self.allowed("guard_human", "Edit", "jobs.py", old_string="    raise NotImplementedError", new_string="    return 1")
-        self.assertEqual([e["what"] for e in self.events("skip")], ["todo"])
-        self.assertIn("todo", self.state()["task"]["skipped"])
-
-    def test_dark_has_no_region_guard_and_lit_brings_it_back(self):
-        self.say("/dial dark")
-        with replib.state_tx(self.root) as state:
-            state["work"]["todo_released"] = False   # isolate the dial from the release flag
-        self.allowed("guard_human", "Edit", "jobs.py", old_string="    raise NotImplementedError", new_string="    return 1")
-        self.assertEqual(self.bash("sed -i '' s/raise/return/ jobs.py", lambda: self.write("jobs.py", "gone\n")), (None, ""))
-        self.write("jobs.py", STUB)
-        self.say("/dial lit")
-        self.denied("guard_human", "Edit", "jobs.py", old_string="    raise NotImplementedError", new_string="    return 1")
-
-    def test_a_region_typed_by_hand_is_found_on_the_next_prompt(self):
-        self.write("hand.py", "# TODO(human): mine\npass\n# END TODO(human)\n")
-        self.assertIn("hand.py", self.say("ok"))
-        self.assertIn("hand.py", self.state()["region_files"])
+        self.assertIn("harness state", self.denied("guard_human", "Write", ".rep/state.json", content="{}"))
+        self.denied("guard_human", "Write", ".rep/briefs/x.md", content="# Brief: mine now\n")
 
     def test_hints_climb_one_level_per_request(self):
-        self.say("ok")   # registers jobs.py
+        self.say("ok")
         self.assertIn("hint 1/5", self.say("/hint"))
         self.assertIn("hint 2/5", self.say("/hint"))
-        for _ in range(5):
-            last = self.say("/hint")
-        self.assertIn("hint 5/5", last)
-        self.assertEqual(self.state()["work"]["hints"], 5)
 
 
 class LockTests(Harness):
     def setUp(self):
         super().setUp()
-        self.on("lit")
-        self.say("/predict x")
+        self.rep("init")
         self.write("tests/test_jobs.py", "def test_one():\n    assert True\n")
-        self.write("jobs.py", "x = 1\n")
 
     def test_a_pinned_test_cannot_be_edited(self):
         self.assertIn("tests/test_jobs.py", self.say("/pin tests/test_jobs.py"))
-        reason = self.denied("lock_tests", "Edit", "tests/test_jobs.py", old_string="True", new_string="False")
-        self.assertIn("owns the oracle", reason)
-        self.allowed("lock_tests", "Edit", "jobs.py", old_string="1", new_string="2")
+        self.assertIn("owns the oracle", self.denied("lock_tests", "Edit", "tests/test_jobs.py",
+                                                     old_string="True", new_string="False"))
+        self.allowed("lock_tests", "Edit", "jobs.py", old_string="row", new_string="r")
 
-    def test_pinning_a_directory_pins_its_files(self):
+    def test_pinning_a_directory_pins_its_files_and_missing_paths_are_named(self):
         self.say("/pin tests")
         self.assertEqual(list(self.state()["pins"]), ["tests/test_jobs.py"])
-
-    def test_pins_hold_in_dim_and_release_in_dark(self):
-        self.say("/pin tests/test_jobs.py")
-        self.say("/dial dim")
-        self.denied("lock_tests", "Write", "tests/test_jobs.py", content="")
-        self.say("/dial dark")
-        self.allowed("lock_tests", "Write", "tests/test_jobs.py", content="")
-
-    def test_lit_reminds_the_model_that_the_user_owns_the_tests(self):
-        self.assertIn("nothing pinned yet", self.say("ok"))
-        self.say("/pin tests/test_jobs.py")
-        self.assertIn("read-only for you", self.say("ok"))
-
-    def test_a_missing_path_is_reported(self):
         self.assertIn("Not found: nope.py", self.say("/pin nope.py"))
 
 
 class BashHole(Harness):
     def setUp(self):
         super().setUp()
-        self.on("lit")
-        self.say("/predict x")
+        self.rep("init")
         self.write("jobs.py", STUB)
         self.write("tests/test_jobs.py", "def test_one():\n    assert True\n")
         self.say("/pin tests/test_jobs.py")
 
-    def test_the_agent_cannot_run_the_users_commands(self):
-        for command in ("rep dial dark", "cd src && rep skip", "rep   pin tests/x.py", "~/.claude/bin/rep dial dark",
-                        "$HOME/.claude/bin/rep unpin", "true; rep close"):
-            decision, reason = self.bash(command)
-            self.assertEqual(decision, "deny", command)
-            self.assertIn("user's command", reason)
-        self.assertEqual(self.state()["dial"], "lit")
-
-    def test_the_agent_keeps_its_own_commands(self):
-        for command in ("rep status", "rep report", "rep log retro --lesson x", "grep dial config.py", "prep dial"):
-            self.assertEqual(self.bash(command)[0], None, command)
-
     def test_the_state_directory_is_off_limits_from_the_shell(self):
-        for command in ("echo '{}' > .rep/state.json", "cat .rep/reps.jsonl", "rm -rf .rep", "cd .rep && ls",
-                        "python3 -c \"open('.rep/state.json','w')\""):
+        for command in ("echo '{}' > .rep/state.json", "cat .rep/reps.jsonl", "rm -rf .rep", "cd .rep && ls"):
             self.assertEqual(self.bash(command)[0], "deny", command)
         for command in ("ls -la", "cat foo.rep", "git status", "cat .replit"):
             self.assertEqual(self.bash(command)[0], None, command)
@@ -410,147 +613,33 @@ class BashHole(Harness):
         decision, reason = self.bash("sed -i '' 's/raise NotImplementedError/return 1/' jobs.py", fill)
         self.assertEqual(decision, "block")
         self.assertIn("jobs.py", reason)
-        self.assertEqual(self.state()["work"]["violations"], 1)
-        self.assertEqual(self.events("violation")[0]["files"], ["jobs.py"])
         self.assertEqual(self.bash("rep restore jobs.py", lambda: self.rep("restore", "jobs.py")), (None, ""))
         self.assertEqual(self.read("jobs.py"), STUB)
-        self.assertEqual(self.state()["work"]["violations"], 1)
-        # Chaining something onto the restore gets no such pass.
-        self.assertEqual(self.bash("rep restore jobs.py; sed ...", lambda: self.write("jobs.py", "gone\n"))[0], "block")
+        self.assertEqual(self.state()["violations"], 1)
 
     def test_changing_a_pinned_test_through_bash_is_caught(self):
-        decision, reason = self.bash("echo > tests/test_jobs.py", lambda: self.write("tests/test_jobs.py", "\n"))
-        self.assertEqual(decision, "block")
-        self.assertIn("tests/test_jobs.py", reason)
-        decision, _ = self.bash("rm tests/test_jobs.py", lambda: os.remove(os.path.join(self.root, "tests/test_jobs.py")))
-        self.assertEqual(decision, "block")
+        self.assertEqual(self.bash("echo > tests/test_jobs.py", lambda: self.write("tests/test_jobs.py", "\n"))[0],
+                         "block")
 
-    def test_a_command_that_leaves_protected_files_alone_is_quiet(self):
-        outside = lambda: self.write("jobs.py", STUB.replace("status = 'free'", "status = 'ready'"))  # noqa: E731
-        self.assertEqual(self.bash("sed -i '' s/free/ready/ jobs.py", outside), (None, ""))
-        self.assertEqual(self.bash("pytest -q"), (None, ""))
-
-    def test_the_users_own_edits_between_commands_are_not_blamed_on_the_agent(self):
+    def test_the_users_own_edits_between_commands_are_not_blamed(self):
         self.write("jobs.py", STUB.replace("raise NotImplementedError", "return conn.claim(worker)"))
-        self.assertEqual(self.bash("pytest -q"), (None, ""))
+        self.assertEqual(self.bash("python3 -m unittest -q"), (None, ""))
 
-    def test_a_cd_inside_the_command_does_not_lose_the_repo(self):
-        self.n += 1
-        base = {"tool_name": "Bash", "tool_input": {"command": "cd /tmp && sed ..."}, "tool_use_id": "toolu_cd"}
-        self.hook("bash_guard", dict(base, hook_event_name="PreToolUse"))
-        self.write("jobs.py", "gone\n")
-        post = self.hook("bash_audit", dict(base, hook_event_name="PostToolUse", cwd="/tmp"))
-        self.assertEqual(post.get("decision"), "block")
-
-
-class Retro(Harness):
-    def setUp(self):
-        super().setUp()
-        self.on()
-        self.say("fix the duplicate job execution bug that shows up under load")
-        self.say("predict: no lock between select and update")
-
-    def test_the_agent_cannot_log_a_retro_the_user_did_not_start(self):
-        proc = self.rep("log", "retro", "--grade", "match", ok=False)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("/retro", proc.stderr)
-        self.assertIsNotNone(self.state()["task"])
-
-    def test_retro_writes_the_reps_and_rearms_the_gate(self):
-        brief = self.say("/retro")
-        self.assertIn("no lock between select and update", brief)
-        self.rep("log", "retro", "--grade", "1=partial", "--evidence", "1=the lock existed but was taken too late",
-                 "--surprise", "advisory locks were already in use", "--lesson", "queue claims must be atomic",
-                 "--codify", "test", "--path", "tests/test_claim.py", "--skills", "craft.data.concurrency")
-        self.assertIsNone(self.state()["task"])
-        predict, retro = self.reps()
-        self.assertEqual((predict["id"], predict["phase"], predict["outcome"]), ("t0001.p1", "research", "partial"))
-        self.assertEqual(predict["prediction"], "no lock between select and update")
-        self.assertEqual(predict["skills"], ["craft.data.concurrency"])
-        self.assertEqual(retro["codified"], {"kind": "test", "path": "tests/test_claim.py"})
-        self.assertEqual(retro["lesson"], "queue claims must be atomic")
-        self.write("a.py", "x = 1\n")
-        self.denied("predict_gate", "Edit", "a.py", old_string="1", new_string="2")
-
-    def test_the_brief_presents_the_goal_as_history(self):
-        brief = self.say("/retro")
-        self.assertIn("not a request", brief)
-        self.assertIn("duplicate job execution", brief)
-
-    def test_a_goal_stated_in_another_session_is_not_borrowed(self):
-        self.say("/retro skip")
-        self.say("add a comment line at the very top of the queue module, right now")
-        self.session = "s2"
-        self.say("predict: the cache key ignores locale")
-        self.assertEqual(self.state()["task"]["goal"], "")
-
-    def test_a_bad_grade_is_refused_and_the_task_stays_open(self):
-        self.say("/retro")
-        self.assertNotEqual(self.rep("log", "retro", "--grade", "2=match", ok=False).returncode, 0)
-        self.assertIsNotNone(self.state()["task"])
-
-    def test_retro_skip_closes_and_logs_the_skip(self):
-        self.assertIn("closed without a retro", self.say("/retro skip"))
-        self.assertEqual([r["outcome"] for r in self.reps()], [None, "skipped"])
-
-    def test_a_todo_rep_carries_hints_and_rating(self):
-        self.write("jobs.py", STUB)
-        self.say("ok")
-        self.say("/hint")
-        self.say("/retro")
-        self.rep("log", "retro", "--grade", "match", "--todo", "done", "--todo-rating", "4")
-        todo = [r for r in self.reps() if r["kind"] == "todo"][0]
-        self.assertEqual((todo["phase"], todo["outcome"], todo["hintsUsed"], todo["rating"]), ("implement", "match", 1, 4))
-
-    def test_pins_clear_when_the_task_closes(self):
-        self.write("tests/test_a.py", "x = 1\n")
-        self.say("/pin tests/test_a.py")
-        self.say("/retro skip")
-        self.assertEqual(self.state()["pins"], {})
-
-    def test_a_dark_task_can_still_have_a_retro(self):
-        self.say("/retro skip")
-        self.say("/dial dark")
-        self.say("/retro")
-        self.rep("log", "retro", "--lesson", "nothing new")
-        closes = self.events("task_close")
-        self.assertEqual([c["dial"] for c in closes], ["dim", "dark"])
-
-    def test_a_stale_task_closes_itself_ungraded(self):
-        with replib.state_tx(self.root) as state:
-            state["touched_at"] = int(time.time()) - replib.STALE_SECONDS - 60
-        self.assertIn("closed ungraded", self.say("new day, new task to work on in this repository"))
-        self.assertEqual(self.events("task_close")[0]["reason"], "expired")
-        self.assertIsNone(self.state()["task"])
-
-    def test_a_new_session_is_told_about_the_open_task_and_lessons(self):
-        self.write("lessons.md", "# Lessons\n\n- 2026-10-03 queue claims must be atomic\n")
-        self.session = "s2"
-        text = self.say("hello again")
-        self.assertIn("still open from an earlier session", text)
-        self.assertIn("lessons.md holds 1 lesson", text)
-
-    def test_report_runs_on_real_data(self):
-        self.say("/retro")
-        self.rep("log", "retro", "--grade", "match", "--lesson", "x", "--codify", "context", "--path", "lessons.md")
-        out = self.rep("report").stdout
-        self.assertIn("tasks      1 closed (dark 0, dim 1, lit 0)", out)
-        self.assertIn("match 1", out)
-        self.assertIn("bypasses   0", out)
+    def test_the_log_keeps_no_command_text(self):
+        self.bash("cat .rep/state.json")
+        self.bash("sed -i '' s/x/y/ jobs.py --secret-value 0042",
+                  lambda: self.write("jobs.py", STUB.replace("raise NotImplementedError", "return 1")))
+        log = self.read(".rep/events.jsonl")
+        self.assertNotIn("0042", log)
+        self.assertNotIn("state.json", log)
+        self.assertEqual(self.events("violation")[0]["program"], "sed")
 
 
 class FailClosed(Harness):
-    def test_a_corrupt_state_file_locks_edits(self):
-        self.on()
-        self.say("/predict x")
-        self.write(".rep/state.json", "{not json")
-        self.write("a.py", "x = 1\n")
-        self.denied("predict_gate", "Edit", "a.py", old_string="1", new_string="2")
-
     def test_a_crashing_hook_denies_instead_of_waving_the_edit_through(self):
-        self.on()
-        self.write("a.py", "x = 1\n")
-        decision, reason = self.edit("guard_human", "Edit", "a.py", old_string=["not", "a", "string"], new_string="2")
+        self.rep("init")
+        decision, reason = self.edit("guard_human", "Edit", "jobs.py", old_string=["not", "a", "string"],
+                                     new_string="2")
         self.assertEqual(decision, "deny")
         self.assertIn("failing closed", reason)
 

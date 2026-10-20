@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""PostToolUse / PostToolUseFailure (Bash): did that command change a protected file?
+"""PostToolUse / PostToolUseFailure (Bash): what did that command change?
 
-Compares each protected file with the snapshot bash_guard.py took just
-before the command ran. The window is one command long, so an edit the user
-saves from their editor between tool calls is never blamed on the agent.
+Two questions, because the edit hooks never see what a shell command writes:
 
-The command has already run, so this cannot prevent anything. It keeps the
-pre-image, logs a violation, and tells the agent to put it back. It does not
-restore on its own: `git checkout` and formatters change files too, and the
-user may have saved the file in the same moment.
+1. Did it change a protected file (a TODO(human) region or a pinned test)?
+   Each file is compared with the snapshot bash_guard.py took just before the
+   command ran, so an edit the user saves between tool calls is never blamed
+   on the agent. The pre-image is kept for `rep restore`; nothing is restored
+   automatically, because `git checkout` and formatters change files too.
+2. Did it push the work past the brief's budget? A code generator or a
+   package install can. The agent hears about it once per new high.
+
+The command has already run, so this cannot prevent anything; it makes sure
+the agent and the log both know.
 """
 import json
 import os
@@ -17,25 +21,37 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import replib  # noqa: E402
 
-MESSAGE = (
+PROTECTED = (
     "rep: protected file(s) changed while your Bash command ran: {files}. TODO(human) regions and pinned tests "
-    "belong to the user. If your command wrote there, that is a violation and it is logged: put each file back "
-    "with `rep restore <file>` (the harness kept the pre-image) and tell the user plainly what happened. If your "
-    "command did not touch the file, the user probably saved it from their editor at the same moment: change "
-    "nothing and mention it."
+    "belong to the user. If your command wrote there, put each file back with `rep restore <file>` (the harness "
+    "kept the pre-image) and tell the user plainly what happened. If your command did not touch the file, the "
+    "user probably saved it from their editor at the same moment: change nothing and mention it."
+)
+BUDGET = (
+    "rep: budget breaker. After that command the work is at {lines} lines across {files} file(s); the brief allows "
+    "{max_lines} lines / {max_files} files. Stop and tell the user what the extra work is for, then cut scope or "
+    "propose a bigger budget with `rep brief draft` for the user to /approve."
 )
 
 
 def main(ev):
+    messages = []
+    root = audit_protected(ev, messages) or replib.session_root(ev)
+    if root:
+        audit_budget(root, messages)
+    if messages:
+        replib.block("\n\n".join(messages))
+
+
+def audit_protected(ev, messages):
     snap_file = replib.snap_path(ev.get("tool_use_id"))
     try:
         with open(snap_file) as f:
             snap = json.load(f)
         os.remove(snap_file)
     except (OSError, ValueError):
-        return
+        return None
     root = snap["root"]
-
     changed = []
     for file, pre in snap["files"].items():
         path = os.path.join(root, file)
@@ -48,15 +64,30 @@ def main(ev):
             os.makedirs(replib.rep_path(root, "keep"), exist_ok=True)
             replib.write_text(replib.keep_path(root, file), pre["text"])
             changed.append(file)
-    if not changed:
-        return
+    if changed:
+        with replib.state_tx(root) as state:
+            state["violations"] += len(changed)
+        command = ((ev.get("tool_input") or {}).get("command") or "").split()
+        replib.event(root, "violation", files=changed, program=os.path.basename(command[0]) if command else "")
+        messages.append(PROTECTED.format(files=", ".join(changed)))
+    return root
 
+
+def audit_budget(root, messages):
+    state = replib.load_state(root)
+    if not state["active"] or not state["base"]:
+        return
+    budget = replib.budget_of(replib.load_brief(root, state["active"]))
+    files, lines = replib.size(replib.changes(root, state["base"]))
+    if not replib.over_budget(budget, files, lines):
+        return
     with replib.state_tx(root) as state:
-        state["work"]["violations"] += len(changed)
-    command = (ev.get("tool_input") or {}).get("command") or ""
-    replib.event(root, "violation", files=changed, command=replib._clip(command, 300),
-                 task=(state["task"] or {}).get("id"))
-    replib.block(MESSAGE.format(files=", ".join(changed)))
+        if lines <= state["over_reported"]:
+            return
+        state["over_reported"] = lines
+        state["trips"] += 1
+    replib.event(root, "budget_trip", via="bash", lines=lines, files=files)
+    messages.append(BUDGET.format(lines=lines, files=files, max_lines=budget["lines"], max_files=budget["files"]))
 
 
 if __name__ == "__main__":

@@ -18,8 +18,11 @@ CLAUDE = os.path.expanduser("~/.claude")
 SETTINGS = os.path.join(CLAUDE, "settings.json")
 LOCAL_BIN = os.path.expanduser("~/.local/bin")
 
-HOOKS = ("replib", "on_prompt", "predict_gate", "lock_tests", "guard_human", "bash_guard", "bash_audit")
-SKILLS = ("predict", "retro", "dial", "skip", "pin", "hint")
+HOOKS = ("replib", "on_prompt", "session_start", "budget_gate", "lock_tests", "guard_human", "bash_guard",
+         "bash_audit", "done_gate", "predict_gate")
+SKILLS = ("shape", "approve", "review", "pin", "hint", "skip")
+# Retired with the move to briefs. Their links are removed and their settings entries stripped.
+RETIRED_SKILLS = ("predict", "retro", "dial")
 LINKS = (
     [("hooks/%s.py" % h, os.path.join(CLAUDE, "hooks", h + ".py")) for h in HOOKS]
     + [("skills/%s" % s, os.path.join(CLAUDE, "skills", s)) for s in SKILLS]
@@ -33,18 +36,22 @@ EDITS = "Edit|Write|MultiEdit|NotebookEdit"
 # rather than PostToolUse, so the audit is registered on both.
 REGISTRATIONS = (
     ("UserPromptSubmit", None, ("on_prompt",)),
-    ("PreToolUse", EDITS, ("predict_gate", "lock_tests", "guard_human")),
+    ("SessionStart", None, ("session_start",)),
+    ("PreToolUse", EDITS, ("budget_gate", "lock_tests", "guard_human")),
     ("PreToolUse", "Bash", ("bash_guard",)),
     ("PostToolUse", "Bash", ("bash_audit",)),
     ("PostToolUseFailure", "Bash", ("bash_audit",)),
+    ("Stop", None, ("done_gate",)),
 )
-# The agent's own rep commands, so a retro does not stop on a permission prompt.
-PERMISSIONS = ("Bash(rep status:*)", "Bash(rep log:*)", "Bash(rep report:*)", "Bash(rep restore:*)")
+# The agent's own rep commands, so working inside a brief never stops on a permission prompt.
+PERMISSIONS = ("Bash(rep status:*)", "Bash(rep log:*)", "Bash(rep report:*)", "Bash(rep restore:*)",
+               "Bash(rep check:*)", "Bash(rep note:*)", "Bash(rep brief:*)")
 
 
 def command(script):
-    # -S skips site-packages; the hooks are stdlib only and this saves ~15 ms a call.
-    return 'python3 -S "$HOME/.claude/hooks/%s.py"' % script
+    # A missing script must not block: Python exits 2 when it can't open a file, and
+    # Claude Code reads exit 2 as "block". -S skips site-packages (stdlib only, ~15 ms).
+    return 'f="$HOME/.claude/hooks/%s.py"; [ -f "$f" ] || exit 0; exec python3 -S "$f"' % script
 
 
 def is_ours(handler):
@@ -138,6 +145,12 @@ def main():
     settings = load_settings()
     strip_ours(settings)
 
+    for name in RETIRED_SKILLS:
+        dst = os.path.join(CLAUDE, "skills", name)
+        if os.path.islink(dst) and os.path.realpath(dst).startswith(REPO + os.sep):
+            os.remove(dst)
+            print("removed %s (retired)" % dst)
+
     if uninstall:
         for src, dst in LINKS:
             print(unlink(src, dst) or "absent  %s" % dst)
@@ -157,7 +170,7 @@ def main():
                   for _, dst in LINKS[-2:])
     if not on_path:
         print("\nNOTE: add ~/.claude/bin to your PATH so `rep` resolves:  export PATH=\"$HOME/.claude/bin:$PATH\"")
-    print("\nrep is installed. In a repo:  rep init   (or type /dial dim inside Claude Code)")
+    print("\nrep is installed. In any repo, type /shape <goal> inside Claude Code.")
     print("Check any time with:        rep doctor")
 
 

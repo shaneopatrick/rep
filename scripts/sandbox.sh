@@ -109,14 +109,16 @@ cat > README.md <<'EOF'
 
 Throwaway. Run the tests with `python3 -m unittest -q`.
 
-Three small tasks, one per dial setting. Start Claude Code here and try them in order.
+Three small pieces of work. Start Claude Code here and try them in order.
 
-1. **dim** (`/dial dim`): "Under load, some jobs run twice. Find out why and fix it."
-2. **lit** (`/dial lit`): "A failed job should be retried with exponential backoff, at most 5 attempts, then marked dead."
-3. **dark** (`/dial dark`): "Add a `stats(conn)` function that returns the number of jobs per status."
+1. `/shape Under load, some jobs run twice. Make claiming a job atomic.`
+   Pick an approach, `/approve` with a pre-mortem, let it work, then `/review`.
+2. `/shape A failed job should be retried with exponential backoff, at most 5 attempts, then marked dead.`
+   Approve a tight budget and watch what happens when the work outgrows it.
+3. No brief: "Add a stats(conn) function that returns the number of jobs per status."
+   This is ordinary Claude Code; rep stays out of the way.
 
-After each one type `/retro`. When all three are done, `rep report` shows the numbers.
-Then delete every prompt or step that felt like busywork before using rep on real work.
+Afterwards, `rep report` shows how your estimates compared with what happened.
 EOF
 
 printf '__pycache__/\n*.db\n' > .gitignore

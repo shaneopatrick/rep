@@ -2,7 +2,7 @@
 """PreToolUse (Edit|Write|MultiEdit|NotebookEdit): pinned tests are read-only for the agent.
 
 The user owns the oracle: a session that implements must not also rewrite the
-tests that judge it. Pins hold in dim and lit and clear when the task closes.
+tests that judge it. Pins hold until the user unpins them or the brief closes.
 """
 import os
 import sys
@@ -23,13 +23,11 @@ def main(ev):
     if not root:
         return
     state = replib.load_state(root)
-    if state["dial"] == "dark":
-        return
     file = replib.rel(root, path)
     if file not in state["pins"]:
         return
     with replib.state_tx(root) as state:
-        state["work"]["blocked"] += 1
+        state["refused"] += 1
     replib.event(root, "lock_deny", tool=ev.get("tool_name"), file=file)
     replib.deny(MESSAGE.format(file=file))
 

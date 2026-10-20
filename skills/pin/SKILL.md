@@ -9,4 +9,4 @@ The rep harness has already handled this command. Its result is in the `[rep]` l
 
 Relay which files are pinned in one line, and name any path that was not found.
 
-Pinned tests are the user's definition of done. Implement against them. If one looks wrong, show the change you would make as a diff in chat and let the user make it. Pins clear when the task closes.
+Pinned tests are the user's definition of done. Implement against them. If one looks wrong, show the change you would make as a diff in chat and let the user make it. Pins clear when the brief closes.
