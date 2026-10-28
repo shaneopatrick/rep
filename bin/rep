@@ -8,6 +8,9 @@ The agent's commands:
   rep brief draft < text    save a draft brief (or a revision) for you to /approve
   rep check                 run the brief's check; the harness records the result
   rep note "<text>"         add a line to the brief's log
+  rep diff                  the brief's whole change, new files included
+  rep simplify start|done   the shrink-only simplify pass, at the start of /review
+  rep mistake <pattern> "<what>"   add to the mistakes register
 
 Yours, in a terminal:
   rep init                  turn rep on for this repo
@@ -21,6 +24,7 @@ Both:
   rep status                brief, budget, check, pins
   rep report                what your briefs add up to
   rep log                   recent closed briefs
+  rep mistakes              the mistakes register, grouped by pattern
   rep restore <file>        put back a protected file changed through Bash
   rep doctor                check the install
 """
@@ -116,6 +120,50 @@ def cmd_check(args):
     sys.exit(proc.returncode)
 
 
+def cmd_diff(args):
+    root = need_root()
+    state = replib.load_state(root)
+    if not state["active"]:
+        sys.exit("rep: no active brief.")
+    sys.stdout.write(replib.brief_diff(root, state))
+
+
+def cmd_simplify(args):
+    root = need_root()
+    with replib.state_tx(root) as state:
+        message, ok = (replib.simplify_start if args.action == "start" else replib.simplify_done)(root, state)
+    print(message)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_mistake(args):
+    root = need_root()
+    if args.pattern not in dict(replib.PATTERNS):
+        sys.exit("rep: unknown pattern %r. Use one of:\n%s" % (args.pattern, "\n".join(
+            "  %-22s %s" % p for p in replib.PATTERNS)))
+    source = "reviewer" if os.environ.get("CLAUDECODE") else "user"
+    with replib.state_tx(root) as state:
+        already = dict((p, n) for p, n, _ in replib.mistakes_by_pattern(root, replib.brief_id(state))).get(args.pattern)
+        replib.record_mistake(root, state, args.pattern, source, " ".join(args.note))
+    print("[rep] recorded: %s." % args.pattern)
+    if already and replib.brief_id(replib.load_state(root)):
+        print("rep: this brief already had %d %s entr%s. If that was the same defect, it is now counted twice; "
+              "the register is append-only, so say so in your reply." % (already, args.pattern,
+                                                                         "y" if already == 1 else "ies"))
+
+
+def cmd_mistakes(args):
+    root = need_root()
+    grouped = replib.mistakes_by_pattern(root)
+    if not grouped:
+        print("no mistakes recorded yet")
+    meaning = dict(replib.PATTERNS)
+    for pattern, count, notes in grouped:
+        print("%-22s x%-3d %s" % (pattern, count, meaning[pattern]))
+        for note in notes:
+            print("%28s %s" % ("-", replib._clip(note, 90)))
+
+
 def cmd_approve(args):
     root = need_root()
     with replib.state_tx(root) as state:
@@ -203,6 +251,13 @@ def cmd_report(args):
         count(checks, lambda c: c.get("redFirst")), len(checks), count(checks, lambda c: c.get("passingAtClose")),
         len(checks), sum(c.get("flakes", 0) for c in checks)))
     print("scope      edits refused for scope or dependencies: %d" % sum(r.get("refused", 0) for r in briefs))
+    passes = [r["simplify"] for r in briefs if r.get("simplify")]
+    if passes:
+        cuts = sorted((p["before"] - p["after"]) / float(p["before"]) for p in passes if p["before"])
+        print("simplify   %d pass(es); median cut %d%% of the diff" % (len(passes), round(cuts[len(cuts) // 2] * 100)))
+    grouped = replib.mistakes_by_pattern(root)
+    if grouped:
+        print("mistakes   %s (rep mistakes for detail)" % ", ".join("%s x%d" % (p, n) for p, n, _ in grouped[:4]))
     print("premortem  written for %d of %d briefs" % (
         count(briefs, lambda r: r.get("premortem") not in (None, "", "(none)")), len(briefs)))
     print("bypasses   %d protected-file change(s) through Bash (0 is the goal)" % sum(
@@ -267,6 +322,11 @@ def main():
     p.set_defaults(fn=cmd_brief)
     p = sub.add_parser("note"); p.add_argument("text", nargs="+"); p.set_defaults(fn=cmd_note)
     p = sub.add_parser("check"); p.set_defaults(fn=cmd_check)
+    p = sub.add_parser("diff"); p.set_defaults(fn=cmd_diff)
+    p = sub.add_parser("simplify"); p.add_argument("action", choices=("start", "done")); p.set_defaults(fn=cmd_simplify)
+    p = sub.add_parser("mistake"); p.add_argument("pattern"); p.add_argument("note", nargs="*")
+    p.set_defaults(fn=cmd_mistake)
+    p = sub.add_parser("mistakes"); p.set_defaults(fn=cmd_mistakes)
     p = sub.add_parser("approve"); p.add_argument("premortem", nargs="*"); p.set_defaults(fn=cmd_approve)
     p = sub.add_parser("review"); p.add_argument("words", nargs="*"); p.set_defaults(fn=cmd_review)
     p = sub.add_parser("pin"); p.add_argument("paths", nargs="*"); p.set_defaults(fn=cmd_pin)

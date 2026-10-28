@@ -45,7 +45,8 @@ REGISTRATIONS = (
 )
 # The agent's own rep commands, so working inside a brief never stops on a permission prompt.
 PERMISSIONS = ("Bash(rep status:*)", "Bash(rep log:*)", "Bash(rep report:*)", "Bash(rep restore:*)",
-               "Bash(rep check:*)", "Bash(rep note:*)", "Bash(rep brief:*)")
+               "Bash(rep check:*)", "Bash(rep note:*)", "Bash(rep brief:*)", "Bash(rep diff:*)",
+               "Bash(rep simplify:*)", "Bash(rep mistake:*)", "Bash(rep mistakes:*)")
 
 
 def command(script):

@@ -47,6 +47,45 @@ HINTS = (
     ("full solution", "the complete solution, shown in chat only; the user still types it"),
 )
 PREMORTEM_PLACEHOLDER = "(yours: add it with /approve <where you expect this to go wrong>)"
+SIMPLIFY_MIN_LINES = 30        # a smaller diff isn't worth a simplify pass
+OVERBUILT_SHARE = 0.25         # a simplify pass that removes this much of the diff means it was overbuilt
+# A fixed vocabulary, so the mistakes register groups instead of collecting
+# free text. Overengineering, skipped verification, stopping short and
+# destructive actions are Ng's agent failure modes; the last three come from
+# founders' field notes on working with agents.
+PATTERNS = (
+    ("overengineering", "built more than the goal needed"),
+    ("skipped-verification", "stopped or claimed done without the check passing on the current code"),
+    ("stopped-short", "the check passed but the goal was not met"),
+    ("weak-check", "the check would also pass a wrong implementation"),
+    ("destructive", "changed or removed something it should not have"),
+    ("scope-drift", "worked outside the brief's approach or paths"),
+    ("wrong-assumption", "an assumption in the brief turned out false"),
+    ("mechanism-not-outcome", "checked that it ran, not that it worked"),
+    ("stale-copy", "changed one copy of a fact and missed the others"),
+    ("trusted-summary", "trusted a summary over the primary source"),
+)
+TESTLIKE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|_test\.[A-Za-z]+$|\.(test|spec)\.[A-Za-z]+$")
+SIMPLIFIER = """You are simplifying a change before it is reviewed. You did not write it, so read it cold.
+
+The brief below is the contract. Its approach and its tradeoff are deliberate: keep them.
+
+{brief}
+
+See the change with `rep diff`. Only what that diff adds or changes is in scope.
+
+Make the change smaller and plainer without changing what it does:
+- delete dead code, unused parameters, imports and variables, and commented-out code
+- inline helpers and abstractions that are used once; drop layers, options and configuration the goal doesn't need
+- where new code duplicates a utility the codebase already has, use the utility
+- remove defensive handling for cases that can't happen
+- straighten control flow: early returns, fewer flags, less nesting
+
+Don't touch code outside the diff, rename things outside it, reformat or restyle, edit tests (they are the oracle), change the approach or its tradeoff, or add anything new. The harness refuses any edit that makes the diff bigger, and any edit to a test file.
+
+Run `rep check` after your edits; it must pass. If a simplification breaks it, undo that one. If nothing is worth simplifying, change nothing: that is a fine result.
+
+Reply with what you removed and why, in at most five lines."""
 
 
 # --- time -------------------------------------------------------------------
@@ -170,6 +209,8 @@ def new_state():
         "hints": 0,
         "todo_released": False,
         "violations": 0,
+        "simplify": None,      # {"phase": "running"|"done", "before": lines, "after": lines}
+        "tagged": [],          # patterns the harness already recorded for this brief
     }
 
 
@@ -377,13 +418,17 @@ def base_text(root, base, relpath):
 
 # --- briefs -----------------------------------------------------------------
 #
-# A brief is markdown with fixed sections. Goal, Approach, Budget and Check
-# are the contract: the agent drafts them, the user approves them. Pre-mortem
-# (the user's words) and Log (notes and harness facts) are written by rep.
+# A brief is markdown with fixed sections. Goal, Approach (ending in the
+# tradeoff it makes), Assumptions (each with its source), Budget and Check are
+# the contract: the agent drafts them, the user approves them. Pre-mortem (the
+# user's words) and Log (notes and harness facts) are written by rep.
 
-CONTRACT = ("goal", "approach", "budget", "check")
+CONTRACT = ("goal", "approach", "assumptions", "budget", "check")
+REQUIRED = ("goal", "approach", "budget", "check")
 _SECTION = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.M)
-_FIELD = re.compile(r"^[ \t]*[-*]?[ \t]*(lines|files|paths|deps|cmd|unverified)[ \t]*:[ \t]*(.*?)[ \t]*$", re.I | re.M)
+_FIELD = re.compile(r"^[ \t]*[-*]?[ \t]*(lines|files|paths|deps|simplify|cmd|unverified)[ \t]*:[ \t]*(.*?)[ \t]*$",
+                    re.I | re.M)
+_TRADEOFF = re.compile(r"^[ \t]*[-*]?[ \t]*Tradeoffs?[ \t]*:[ \t]*(\S.*?)[ \t]*$", re.I | re.M)
 
 
 def parse_brief(text):
@@ -412,11 +457,22 @@ def budget_of(brief):
 
     paths = [p.strip().rstrip("/") for p in re.split(r"[,\s]+", fields.get("paths", "")) if p.strip()]
     return {"lines": number("lines"), "files": number("files"), "paths": paths,
-            "deps": fields.get("deps", "no").strip().lower() in ("yes", "y", "true", "allowed")}
+            "deps": fields.get("deps", "no").strip().lower() in ("yes", "y", "true", "allowed"),
+            "simplify": fields.get("simplify", "yes").strip().lower() not in ("no", "n", "false", "off")}
 
 
 def check_cmd(brief):
     return brief["fields"].get("cmd", "").strip("` ") or None
+
+
+def tradeoff_of(brief):
+    m = _TRADEOFF.search(brief["sections"].get("approach", ""))
+    return m.group(1) if m else None
+
+
+def assumptions_of(brief):
+    return [line.strip().lstrip("-* ").strip() for line in brief["sections"].get("assumptions", "").splitlines()
+            if line.strip()]
 
 
 def problems(brief):
@@ -424,9 +480,15 @@ def problems(brief):
     issues = []
     if not brief["title"]:
         issues.append("a '# Brief: <title>' line")
-    for name in CONTRACT:
+    for name in REQUIRED:
         if not brief["sections"].get(name, "").strip():
             issues.append("a '## %s' section" % name.capitalize())
+    if brief["sections"].get("approach", "").strip() and not tradeoff_of(brief):
+        issues.append("a 'Tradeoff:' line under Approach (what it favours and what it gives up)")
+    unsourced = [a for a in assumptions_of(brief) if "source:" not in a.lower()]
+    if unsourced:
+        issues.append("a 'source:' on every assumption, naming where it can be checked (a file, a command, a doc); "
+                      "missing on: %s" % "; ".join(_clip(a, 60) for a in unsourced))
     budget = budget_of(brief)
     if budget["lines"] is None or budget["files"] is None:
         issues.append("'lines: <n>' and 'files: <n>' under Budget")
@@ -444,8 +506,9 @@ def render_brief(brief, premortem, log, asked):
         out.append("Asked: \"%s\"" % asked)
     extras = [n for n in brief["order"] if n not in CONTRACT + ("pre-mortem", "log")]
     for name in CONTRACT + tuple(extras):
-        out += ["", "## %s" % ("Pre-mortem" if name == "pre-mortem" else name.capitalize()),
-                brief["sections"].get(name, "").strip()]
+        body = brief["sections"].get(name, "").strip()
+        if body or name in REQUIRED:
+            out += ["", "## %s" % name.capitalize(), body]
     out += ["", "## Pre-mortem", premortem.strip(), "", "## Log", log.strip()]
     return "\n".join(out).rstrip() + "\n"
 
@@ -490,8 +553,125 @@ def shape(root, state, args):
         return "[rep] usage: /shape <what you want done>"
     state.update(asked=_clip(words, 300), runs=[], flakes=0)
     event(root, "shape", revision=False)
-    return ("[rep] shaping, at the user's request: \"%s\". Follow the shape skill. Write the draft with "
-            "`rep brief draft`; no code edits until the user approves it." % _clip(words, 300))
+    message = ("[rep] shaping, at the user's request: \"%s\". Follow the shape skill. Write the draft with "
+               "`rep brief draft`; no code edits until the user approves it." % _clip(words, 300))
+    common = mistakes_by_pattern(root)[:3]
+    if common:
+        message += (" Mistakes seen most in this repo: %s. Shape against them: an assumption, a check or a "
+                    "budget that would catch them." % ", ".join("%s x%d" % (p, n) for p, n, _ in common))
+    return message
+
+
+# --- the mistakes register --------------------------------------------------
+
+def brief_id(state):
+    return os.path.basename(state["active"])[:-3] if state["active"] else None
+
+
+def record_mistake(root, state, pattern, source, note="", once=False):
+    """Append to the register. With once=True a pattern is recorded at most
+    once per brief, so five budget trips read as one overengineering entry."""
+    if pattern not in dict(PATTERNS):
+        return False
+    if once:
+        if pattern in state["tagged"]:
+            return False
+        state["tagged"].append(pattern)
+    _append(root, "mistakes.jsonl", {"at": iso(), "brief": brief_id(state), "pattern": pattern,
+                                     "source": source, "note": _clip(note, 300)})
+    return True
+
+
+def mistakes_by_pattern(root, brief=None):
+    """[(pattern, count, latest notes)] most frequent first."""
+    rows = [r for r in read_jsonl(root, "mistakes.jsonl") if brief is None or r.get("brief") == brief]
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r["pattern"], []).append(r)
+    return sorted(((p, len(rs), [r["note"] for r in rs if r.get("note")][-2:]) for p, rs in grouped.items()),
+                  key=lambda item: -item[1])
+
+
+def _tagged_note(note):
+    """'stopped-short: also cover retries' -> ('stopped-short', 'also cover retries')."""
+    head, sep, rest = note.partition(":")
+    return (head.strip().lower(), rest.strip()) if sep and head.strip().lower() in dict(PATTERNS) else (None, note)
+
+
+# --- the simplify pass ------------------------------------------------------
+
+def simplify_due(f, state):
+    return (f["budget"]["simplify"] and state["simplify"] is None and f["lines"] is not None
+            and f["lines"] >= SIMPLIFY_MIN_LINES)
+
+
+def passing_now(f, state):
+    runs = state["runs"]
+    return bool(runs and runs[-1]["ok"] and runs[-1]["tree"] == f["tree"])
+
+
+def simplify_start(root, state):
+    """Returns (message, ok). The pass starts from code the check passes on."""
+    if not state["active"]:
+        return "rep: no active brief.", False
+    if state["simplify"] and state["simplify"]["phase"] == "running":
+        return "rep: the simplify pass is already open. Finish with `rep check`, then `rep simplify done`.", False
+    f = facts(root, state)
+    if f["lines"] is None:
+        return "rep: not a git repo, so the diff can't be measured.", False
+    if not passing_now(f, state):
+        return "rep: the check has to pass on the current code before simplifying. Run `rep check` first.", False
+    state["simplify"] = {"phase": "running", "before": f["lines"], "after": None}
+    append_log(root, state, "simplify pass started at %d lines" % f["lines"])
+    event(root, "simplify_start", lines=f["lines"])
+    contract = read_text(rep_path(root, state["active"])).partition("\n## Pre-mortem")[0].strip()
+    return ("[rep] simplify pass started at %d lines. Until `rep simplify done`, edits that grow the diff and edits "
+            "to tests are refused.\n\nStart one fresh subagent with exactly this prompt, and nothing from this "
+            "conversation:\n\n---\n%s\n---\n\nWhen it finishes, run `rep check` (it must pass), then "
+            "`rep simplify done`." % (f["lines"], SIMPLIFIER.format(brief=contract))), True
+
+
+def simplify_done(root, state):
+    """Returns (message, ok)."""
+    if not (state["simplify"] and state["simplify"]["phase"] == "running"):
+        return "rep: no simplify pass is open. `rep simplify start` begins one.", False
+    f = facts(root, state)
+    if not passing_now(f, state):
+        return "rep: run `rep check` first; it must pass on the simplified code.", False
+    before, after = state["simplify"]["before"], f["lines"]
+    state["simplify"] = {"phase": "done", "before": before, "after": after}
+    share = (before - after) / float(before) if before else 0.0
+    append_log(root, state, "simplified: %d -> %d lines" % (before, after))
+    event(root, "simplify_done", before=before, after=after)
+    if share >= OVERBUILT_SHARE:
+        record_mistake(root, state, "overengineering", "harness",
+                       "simplify pass removed %d%% of the diff" % round(share * 100), once=True)
+    return "[rep] simplify pass closed: %d -> %d lines, check passing. Hand over for /review." % (before, after), True
+
+
+def simplify_line(f, state):
+    s = state["simplify"]
+    if s and s["phase"] == "done":
+        cut = (s["before"] - s["after"]) / float(s["before"]) if s["before"] else 0.0
+        return "Simplify pass: %d -> %d lines (-%d%%), check passing after." % (s["before"], s["after"], round(cut * 100))
+    if s:
+        return "Simplify pass: still open."
+    if not f["budget"]["simplify"]:
+        return "Simplify pass: turned off in the brief."
+    if f["lines"] is not None and f["lines"] < SIMPLIFY_MIN_LINES:
+        return "Simplify pass: skipped, the diff is under %d lines." % SIMPLIFY_MIN_LINES
+    if f["lines"] is None:
+        return "Simplify pass: not run (no git, so the diff can't be measured)."
+    return "Simplify pass: due (%d lines). Run it first, then review the simplified code." % f["lines"]
+
+
+def brief_diff(root, state):
+    """The brief's whole change, new files included: base snapshot to now."""
+    if not state["base"]:
+        return ""
+    current = snapshot(root)
+    _, text = git(root, "diff", "--no-renames", state["base"], current) if current else (1, "")
+    return text
 
 
 def draft(root, state, text):
@@ -530,6 +710,11 @@ def approve(root, state, premortem):
             stamp(), ", ".join(changed) or "nothing")
         write_text(rep_path(root, state["active"]), render_brief(
             proposed, premortem or active["sections"].get("pre-mortem", ""), log, active["asked"]))
+        dropped = [a for a in assumptions_of(active) if a not in assumptions_of(proposed)]
+        if dropped:
+            record_mistake(root, state, "wrong-assumption", "harness",
+                           "revised away: " + "; ".join(_clip(a, 120) for a in dropped))
+        state["simplify"] = None   # more work may follow, so simplify again after it
         message = ("[rep] revision approved by the user (%s changed). Keep working inside the brief."
                    % (", ".join(changed) or "nothing"))
     else:
@@ -540,7 +725,7 @@ def approve(root, state, premortem):
         log = "- %s approved by the user (base %s)" % (stamp(), base[:7] if base else "none: not a git repo")
         write_text(rep_path(root, "briefs", name), render_brief(proposed, premortem or "(none)", log, state["asked"]))
         state.update(active="briefs/" + name, base=base, approved_at=now(), review_at=None, trips=0, refused=0,
-                     over_reported=0, todos={}, hints=0, todo_released=False)
+                     over_reported=0, todos={}, hints=0, todo_released=False, simplify=None, tagged=[])
         budget = budget_of(proposed)
         message = ("[rep] brief approved by the user: \"%s\". Budget %d lines / %d files, check `%s`.%s Start the work."
                    % (proposed["title"], budget["lines"], budget["files"], check_cmd(proposed),
@@ -598,15 +783,23 @@ def review(root, state, args):
         return "[rep] no active brief to review."
     word, _, note = args.strip().partition(" ")
     word, note = word.lower(), note.strip()
+    pattern = None
+    if word in ("accept", "reject", "redirect"):
+        pattern, text = _tagged_note(note)
+        if pattern:
+            record_mistake(root, state, pattern, "user", text)
+    recorded = " The harness recorded it as %s; don't record it again." % pattern if pattern else ""
     if word in ("accept", "reject"):
         return close(root, state, "accepted" if word == "accept" else "rejected", note)
     if word == "redirect":
         append_log(root, state, "redirected by the user: %s" % (note or "(no note)"))
-        state["review_at"] = None
+        state.update(review_at=None, simplify=None)
         event(root, "redirect")
-        return "[rep] redirected by the user: \"%s\". Keep working inside the brief." % _clip(note, 300)
+        return "[rep] redirected by the user: \"%s\". Keep working inside the brief.%s" % (_clip(note, 300), recorded)
     if word:
-        return "[rep] usage: /review, then /review accept | redirect <what to change> | reject"
+        return ("[rep] usage: /review, then /review accept | redirect <what to change> | reject. Start the note "
+                "with a pattern to record a mistake, e.g. /review redirect stopped-short: <note>. Patterns: %s"
+                % ", ".join(p for p, _ in PATTERNS))
     state["review_at"] = now()
     event(root, "review_start")
     return packet(root, state)
@@ -631,12 +824,22 @@ def packet(root, state):
                          state["trips"], state["refused"]))
         listed = sorted(f["change_map"].items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:8]
         lines += ["  %s +%d -%d" % (p, a, d) for p, (a, d) in listed]
+    lines.append(simplify_line(f, state))
+    lines.append("Chosen tradeoff: %s" % (tradeoff_of(f["brief"]) or "none stated."))
+    assumptions = assumptions_of(f["brief"])
+    if assumptions:
+        lines.append("Assumptions: %d, each with a source. The reviewer checks every one against its source." %
+                     len(assumptions))
     premortem = f["brief"]["sections"].get("pre-mortem", "").strip()
     lines.append("Pre-mortem, written by the user before the work: %s" % (
         "\"%s\"" % _clip(premortem, 400) if premortem and premortem != "(none)" else "none."))
     unverified = f["brief"]["fields"].get("unverified")
     if unverified:
         lines.append("Not covered by the check, per the brief: %s" % unverified)
+    recorded = mistakes_by_pattern(root, brief_id(state))
+    if recorded:
+        lines.append("Mistakes recorded on this brief so far: %s." % ", ".join(
+            "%s x%d" % (p, n) for p, n, _ in recorded))
     lines.append("Follow the review skill, then ask the user to decide: /review accept, /review redirect "
                  "<what to change>, or /review reject.")
     return "\n".join(lines)
@@ -654,6 +857,10 @@ def close(root, state, outcome, note):
                   "passingAtClose": bool(last and last["ok"] and last["tree"] == f["tree"])},
         "premortem": f["brief"]["sections"].get("pre-mortem", "").strip(), "hintsUsed": state["hints"],
         "todos": sorted(state["todos"]), "violations": state["violations"],
+        "simplify": ({"before": state["simplify"]["before"], "after": state["simplify"]["after"]}
+                     if state["simplify"] and state["simplify"]["phase"] == "done" else None),
+        "mistakes": {p: n for p, n, _ in mistakes_by_pattern(root, brief_id(state))},
+        "tradeoff": tradeoff_of(f["brief"]), "assumptions": len(assumptions_of(f["brief"])),
         "approvedAt": iso(state["approved_at"]) if state["approved_at"] else None, "createdAt": iso(),
         "durationS": now() - state["approved_at"] if state["approved_at"] else None,
     }
@@ -696,6 +903,8 @@ def status_line(root, state):
         parts = ["brief \"%s\"" % f["title"], usage(f), f["check"]]
         if state["draft"]:
             parts.append("a revision draft is waiting for the user's /approve")
+        if state["simplify"] and state["simplify"]["phase"] == "running":
+            parts.append("simplify pass open: shrink-only, tests off-limits, finish with `rep simplify done`")
         if state["review_at"]:
             parts.append("review in progress")
         line = "[rep] " + " · ".join(parts) + ". Run the check with `rep check`; record decisions with `rep note`."
