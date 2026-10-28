@@ -9,7 +9,11 @@ Two questions, because the edit hooks never see what a shell command writes:
    on the agent. The pre-image is kept for `rep restore`; nothing is restored
    automatically, because `git checkout` and formatters change files too.
 2. Did it push the work past the brief's budget? A code generator or a
-   package install can. The agent hears about it once per new high.
+   package install can. The agent hears about it once per new high. During
+   the simplify pass any growth at all is reported, since the pass is
+   shrink-only.
+
+Protected-file changes and budget trips go into the mistakes register.
 
 The command has already run, so this cannot prevent anything; it makes sure
 the agent and the log both know.
@@ -26,6 +30,10 @@ PROTECTED = (
     "belong to the user. If your command wrote there, put each file back with `rep restore <file>` (the harness "
     "kept the pre-image) and tell the user plainly what happened. If your command did not touch the file, the "
     "user probably saved it from their editor at the same moment: change nothing and mention it."
+)
+SIMPLIFY_GROW = (
+    "rep: the simplify pass is shrink-only, and that command grew the diff from {before} to {lines} lines. Undo the "
+    "growth, then carry on simplifying."
 )
 BUDGET = (
     "rep: budget breaker. After that command the work is at {lines} lines across {files} file(s); the brief allows "
@@ -67,6 +75,8 @@ def audit_protected(ev, messages):
     if changed:
         with replib.state_tx(root) as state:
             state["violations"] += len(changed)
+            replib.record_mistake(root, state, "destructive", "harness",
+                                  "changed %s through Bash" % ", ".join(changed))
         command = ((ev.get("tool_input") or {}).get("command") or "").split()
         replib.event(root, "violation", files=changed, program=os.path.basename(command[0]) if command else "")
         messages.append(PROTECTED.format(files=", ".join(changed)))
@@ -79,6 +89,10 @@ def audit_budget(root, messages):
         return
     budget = replib.budget_of(replib.load_brief(root, state["active"]))
     files, lines = replib.size(replib.changes(root, state["base"]))
+    simplify = state["simplify"]
+    if simplify and simplify["phase"] == "running" and lines > simplify["before"]:
+        replib.event(root, "simplify_grow", via="bash")
+        messages.append(SIMPLIFY_GROW.format(before=simplify["before"], lines=lines))
     if not replib.over_budget(budget, files, lines):
         return
     with replib.state_tx(root) as state:
@@ -86,6 +100,8 @@ def audit_budget(root, messages):
             return
         state["over_reported"] = lines
         state["trips"] += 1
+        replib.record_mistake(root, state, "overengineering", "harness",
+                              "budget breaker tripped at %d lines" % lines, once=True)
     replib.event(root, "budget_trip", via="bash", lines=lines, files=files)
     messages.append(BUDGET.format(lines=lines, files=files, max_lines=budget["lines"], max_files=budget["files"]))
 

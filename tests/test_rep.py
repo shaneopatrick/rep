@@ -31,23 +31,31 @@ def release(conn, job):
 '''
 
 
+TRADEOFF = "Tradeoff: favours simplicity and consistency; gives up throughput under heavy contention"
+
+
 def brief_text(lines=20, files=2, paths="jobs.py, tests/", deps="no", cmd="grep -q atomic jobs.py",
-               title="No job runs twice"):
-    return """# Brief: %s
+               title="No job runs twice", tradeoff=TRADEOFF, assumptions=(), simplify=None):
+    text = """# Brief: %s
 ## Goal
 A job is never executed by two workers.
 ## Approach
 Atomic claim with UPDATE ... RETURNING.
+%s
 Rejected: advisory locks (more moving parts); a queue library (new dependency)
-## Budget
+""" % (title, tradeoff)
+    if assumptions:
+        text += "## Assumptions\n" + "".join("- %s\n" % a for a in assumptions)
+    text += """## Budget
 lines: %s
 files: %s
 paths: %s
 deps: %s
-## Check
+%s## Check
 cmd: %s
 unverified: behaviour on Postgres
-""" % (title, lines, files, paths, deps, cmd)
+""" % (lines, files, paths, deps, "simplify: %s\n" % simplify if simplify else "", cmd)
+    return text
 
 
 class Harness(unittest.TestCase):
@@ -633,6 +641,192 @@ class BashHole(Harness):
         self.assertNotIn("0042", log)
         self.assertNotIn("state.json", log)
         self.assertEqual(self.events("violation")[0]["program"], "sed")
+
+
+SOURCED = ("SQLite is 3.35 or newer (source: python3 -c 'import sqlite3; print(sqlite3.sqlite_version)')",
+           "claim() is the only writer of 'running' (source: grep -rn running jobq/)")
+
+
+class BriefContract(Harness):
+    def setUp(self):
+        super().setUp()
+        self.say("/shape make claims atomic so no job runs twice")
+
+    def test_a_draft_must_name_its_tradeoff(self):
+        out = self.draft(brief_text(tradeoff="Keeps it simple."), ok=False).stdout
+        self.assertIn("'Tradeoff:' line under Approach", out)
+
+    def test_every_assumption_needs_a_source(self):
+        out = self.draft(brief_text(assumptions=(SOURCED[0], "workers share one database")), ok=False).stdout
+        self.assertIn("'source:' on every assumption", out)
+        self.assertIn("workers share one database", out)
+
+    def test_assumptions_and_tradeoff_reach_the_review_packet(self):
+        self.draft(brief_text(assumptions=SOURCED))
+        self.say("/approve")
+        self.assertIn("## Assumptions\n- SQLite is 3.35 or newer", self.brief())
+        packet = self.say("/review")
+        self.assertIn("Assumptions: 2, each with a source. The reviewer checks every one", packet)
+        self.assertIn("Chosen tradeoff: favours simplicity and consistency", packet)
+
+    def test_a_brief_without_assumptions_has_no_empty_section(self):
+        self.draft()
+        self.say("/approve")
+        self.assertNotIn("## Assumptions", self.brief())
+
+    def test_revising_an_assumption_away_records_a_wrong_assumption(self):
+        self.draft(brief_text(assumptions=SOURCED))
+        self.say("/approve")
+        self.draft(brief_text(assumptions=SOURCED[1:]))
+        self.assertIn("Assumptions changed", self.say("/approve"))
+        rows = replib.read_jsonl(self.root, "mistakes.jsonl")
+        self.assertEqual([r["pattern"] for r in rows], ["wrong-assumption"])
+        self.assertIn("revised away: SQLite is 3.35 or newer", rows[0]["note"])
+
+
+class Mistakes(Harness):
+    def setUp(self):
+        super().setUp()
+        self.activate()
+
+    def patterns(self):
+        return [r["pattern"] for r in replib.read_jsonl(self.root, "mistakes.jsonl")]
+
+    def test_budget_trips_record_overengineering_once_per_brief(self):
+        grow = dict(old_string="    return row\n", new_string="    return row\n" + "    pass\n" * 30)
+        self.denied("budget_gate", "Edit", "jobs.py", **grow)
+        self.denied("budget_gate", "Edit", "jobs.py", **grow)
+        self.assertEqual(self.patterns(), ["overengineering"])
+
+    def test_scope_refusals_record_scope_drift(self):
+        self.denied("budget_gate", "Write", "scheduler.py", content="x = 1\n")
+        self.assertEqual(self.patterns(), ["scope-drift"])
+
+    def test_unchecked_changes_record_skipped_verification(self):
+        self.say("go")
+        self.write("jobs.py", JOBS + "# atomic\n")
+        self.stop()
+        self.assertEqual(self.patterns(), ["skipped-verification"])
+
+    def test_a_bash_write_to_a_protected_region_records_destructive(self):
+        self.write("jobs.py", STUB)
+        self.say("ok")
+        self.bash("sed ...", lambda: self.write("jobs.py", STUB.replace("raise NotImplementedError", "return 1")))
+        self.assertEqual(self.patterns(), ["destructive"])
+
+    def test_the_user_records_a_pattern_by_starting_the_review_note_with_it(self):
+        self.say("/review redirect stopped-short: retries are not covered")
+        row = replib.read_jsonl(self.root, "mistakes.jsonl")[0]
+        self.assertEqual((row["pattern"], row["source"], row["note"]), ("stopped-short", "user", "retries are not covered"))
+        self.assertIn("redirected by the user: stopped-short: retries are not covered", self.brief())
+
+    def test_a_pattern_the_user_named_is_recorded_once_and_doubles_are_flagged(self):
+        self.assertIn("don't record it again", self.say("/review redirect weak-check: pin the 8s delay"))
+        self.assertIn("already had 1 weak-check entry", self.rep("mistake", "weak-check", "same gap").stdout)
+
+    def test_unknown_patterns_are_refused(self):
+        self.rep("mistake", "stale-copy", "changed", "one", "copy", "of", "the", "limit")
+        proc = self.rep("mistake", "bogus", "x", ok=False)
+        self.assertIn("unknown pattern", proc.stderr)
+        self.assertEqual(self.patterns(), ["stale-copy"])
+
+    def test_the_register_groups_by_pattern_and_shapes_the_next_brief(self):
+        for pattern in ("stale-copy", "trusted-summary", "stale-copy"):
+            self.rep("mistake", pattern, "an example")
+        self.assertTrue(self.rep("mistakes").stdout.startswith("stale-copy"))
+        self.say("/review accept")
+        self.assertEqual(self.closed()[0]["mistakes"], {"stale-copy": 2, "trusted-summary": 1})
+        self.assertIn("Mistakes seen most in this repo: stale-copy x2, trusted-summary x1",
+                      self.say("/shape add retries"))
+        self.assertIn("mistakes   stale-copy x2, trusted-summary x1", self.rep("report").stdout)
+
+
+class Simplify(Harness):
+    BIG = JOBS + "# atomic\n" + "".join("x%d = %d\n" % (i, i) for i in range(40))      # 41 lines over base
+    SMALL = JOBS + "# atomic\n" + "".join("x%d = %d\n" % (i, i) for i in range(20))    # 21 lines
+
+    def setUp(self):
+        super().setUp()
+        self.activate(lines=200, files=3)
+
+    def green(self, text):
+        self.say("go")
+        self.write("jobs.py", text)
+        self.rep("check")
+
+    def test_the_pass_is_due_at_review_not_at_the_end_of_the_build_turn(self):
+        self.green(self.BIG)
+        self.assertIn("check passing", self.stop()["systemMessage"])      # no nudge: the user's /review asks for it
+        self.assertIn("Simplify pass: due (41 lines). Run it first", self.say("/review"))
+
+    def test_small_diffs_and_briefs_that_opt_out_skip_it(self):
+        self.green(JOBS + "# atomic\n")
+        self.assertIn("check passing", self.stop()["systemMessage"])
+        self.assertIn("skipped, the diff is under 30 lines", self.say("/review"))
+        self.say("/review reject")
+        self.activate(lines=200, files=3, simplify="no")
+        self.green(self.BIG)
+        self.assertIn("systemMessage", self.stop())
+        self.assertIn("turned off in the brief", self.say("/review"))
+
+    def test_the_pass_starts_only_from_passing_code_and_hands_over_a_cold_prompt(self):
+        self.write("jobs.py", self.BIG)
+        self.assertIn("has to pass", self.rep("simplify", "start", ok=False).stdout)
+        self.rep("check")
+        out = self.rep("simplify", "start").stdout
+        self.assertIn("simplify pass started at 41 lines", out)
+        self.assertIn("You are simplifying a change before it is reviewed", out)
+        self.assertIn("# Brief: No job runs twice", out)
+        self.assertIn("rep diff", out)
+        self.assertNotIn("## Log", out)
+
+    def test_the_pass_is_shrink_only_and_leaves_tests_alone(self):
+        self.write("tests/test_jobs.py", "def test_one():\n    assert True\n")
+        self.green(self.BIG)
+        self.rep("simplify", "start")
+        self.assertIn("shrink-only", self.denied("budget_gate", "Edit", "jobs.py", old_string="x0 = 0\n",
+                                                 new_string="x0 = 0\nextra = 1\n"))
+        self.allowed("budget_gate", "Edit", "jobs.py", old_string="x0 = 0\nx1 = 1\n", new_string="")
+        self.assertIn("off-limits", self.denied("budget_gate", "Write", "tests/test_jobs.py", content=""))
+        decision, reason = self.bash("python3 gen.py", lambda: self.write("jobs.py", self.BIG + "y = 1\n"))
+        self.assertEqual(decision, "block")
+        self.assertIn("shrink-only", reason)
+
+    def test_done_needs_the_check_passing_on_the_simplified_code_and_measures_the_cut(self):
+        self.green(self.BIG)
+        self.rep("simplify", "start")
+        self.write("jobs.py", self.SMALL)
+        self.assertIn("run `rep check` first", self.rep("simplify", "done", ok=False).stdout)
+        self.rep("check")
+        self.assertIn("41 -> 21 lines", self.rep("simplify", "done").stdout)
+        self.assertIn("simplified: 41 -> 21 lines", self.brief())
+        self.assertEqual([r["pattern"] for r in replib.read_jsonl(self.root, "mistakes.jsonl")], ["overengineering"])
+        self.assertIn("Simplify pass: 41 -> 21 lines (-49%)", self.say("/review"))
+        self.say("/review accept")
+        self.assertEqual(self.closed()[0]["simplify"], {"before": 41, "after": 21})
+        self.assertIn("simplify   1 pass(es); median cut 49% of the diff", self.rep("report").stdout)
+
+    def test_an_open_pass_is_called_out_at_stop(self):
+        self.green(self.BIG)
+        self.rep("simplify", "start")
+        self.say("go on")
+        self.write("jobs.py", self.SMALL)
+        self.rep("check")
+        self.assertIn("still open", self.stop()["hookSpecificOutput"]["additionalContext"])
+
+    def test_a_redirect_reopens_the_pass_for_the_next_round(self):
+        self.green(self.BIG)
+        self.rep("simplify", "start")
+        self.rep("simplify", "done")
+        self.say("/review redirect also handle retries")
+        self.assertIsNone(self.state()["simplify"])
+
+    def test_rep_diff_shows_the_whole_change_including_new_files(self):
+        self.write("jobs.py", JOBS + "# atomic\n")
+        self.write("tests/test_new.py", "def test_new():\n    pass\n")
+        out = self.rep("diff").stdout
+        self.assertIn("+# atomic", out)
+        self.assertIn("tests/test_new.py", out)
 
 
 class FailClosed(Harness):

@@ -7,6 +7,11 @@
   alone unless `deps: yes`, and stop at the budget. The edit is simulated, so
   the one that would cross the line is refused, while edits that shrink the
   diff always go through: cutting scope is never blocked.
+- During the simplify pass: shrink-only, and tests are off-limits. A pass
+  that may only make the diff smaller would otherwise find deleting test
+  assertions the easiest way to do it.
+
+Budget trips and scope refusals are recorded in the mistakes register.
 """
 import os
 import sys
@@ -25,6 +30,14 @@ SCOPE = (
 DEPS = (
     "rep: {file} is a dependency manifest and the brief says no new dependencies. If one is truly needed, stop "
     "and propose a revision with `deps: yes` and the reason; the user approves it with /approve."
+)
+SIMPLIFY_GROW = (
+    "rep: the simplify pass is shrink-only, and this edit would grow the diff ({now_lines} -> {lines} lines). "
+    "Simplify by removing or inlining, not by adding. If something is missing, finish the pass first."
+)
+SIMPLIFY_TESTS = (
+    "rep: {file} looks like a test, and tests are off-limits during the simplify pass: they are the oracle the "
+    "simplified code is measured against."
 )
 BUDGET = (
     "rep: budget breaker. This edit would bring the work to {lines} lines across {files} file(s); the brief allows "
@@ -50,9 +63,12 @@ def main(ev):
 
     budget = replib.budget_of(replib.load_brief(root, state["active"]))
     if os.path.basename(file) in replib.MANIFESTS and not budget["deps"]:
-        refuse(root, "deps", file, DEPS.format(file=file))
+        refuse(root, "deps", file, DEPS.format(file=file), "scope-drift")
     if not replib.in_scope(file, budget["paths"]):
-        refuse(root, "scope", file, SCOPE.format(file=file, paths=", ".join(budget["paths"])))
+        refuse(root, "scope", file, SCOPE.format(file=file, paths=", ".join(budget["paths"])), "scope-drift")
+    simplifying = bool(state["simplify"] and state["simplify"]["phase"] == "running")
+    if simplifying and replib.TESTLIKE.search(file):
+        refuse(root, "simplify_test", file, SIMPLIFY_TESTS.format(file=file))
     if not state["base"]:
         return
 
@@ -71,17 +87,24 @@ def main(ev):
     now_files, now_lines = replib.size(now_map)
     files, lines = replib.size(next_map)
     grows = lines > now_lines or files > now_files
+    if grows and simplifying:
+        replib.event(root, "simplify_grow", file=file)
+        replib.deny(SIMPLIFY_GROW.format(now_lines=now_lines, lines=lines))
     if grows and replib.over_budget(budget, files, lines):
         with replib.state_tx(root) as state:
             state["trips"] += 1
+            replib.record_mistake(root, state, "overengineering", "harness",
+                                  "budget breaker tripped at %d lines" % lines, once=True)
         replib.event(root, "budget_trip", via="edit", lines=lines, files=files)
         replib.deny(BUDGET.format(lines=lines, files=files, max_lines=budget["lines"], max_files=budget["files"],
                                   now_lines=now_lines, now_files=now_files))
 
 
-def refuse(root, why, file, message):
+def refuse(root, why, file, message, pattern=None):
     with replib.state_tx(root) as state:
         state["refused"] += 1
+        if pattern:
+            replib.record_mistake(root, state, pattern, "harness", "%s refused for %s" % (file, why), once=True)
     replib.event(root, "refused", why=why, file=file)
     replib.deny(message)
 
